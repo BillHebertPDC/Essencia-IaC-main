@@ -1,0 +1,542 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Template CloudFormation com VPC, 2 Subnets, Docker Swarm automatizado (2 Managers + 4 Workers) e SFTP configurado."
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: Essencia
+    Description: "Prefixo dos nomes e tags das aplicacoes."
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, qas, prod]
+    Description: "Ambiente de implantacao."
+  ImageId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
+    Description: "Busca automaticamente a AMI oficial do Ubuntu 24.04 LTS mais recente na regiao."
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: "Tipo das instancias EC2."
+  KeyName:
+    Type: String
+    Default: ""
+    Description: "(Opcional) Nome do Key Pair cadastrado na AWS para conexao SSH."
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/20
+    Description: "Bloco CIDR de rede para a VPC."
+  SubnetAz1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: "Bloco CIDR para a Subnet da AZ 1."
+  SubnetAz2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: "Bloco CIDR para a Subnet da AZ 2."
+  Az1:
+    Type: "AWS::EC2::AvailabilityZone::Name"
+    Default: us-east-1a
+    Description: "Primeira Zona de Disponibilidade."
+  Az2:
+    Type: "AWS::EC2::AvailabilityZone::Name"
+    Default: us-east-1b
+    Description: "Segunda Zona de Disponibilidade."
+  MyIP:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: "Endereco IP/CIDR com permissao para acesso SSH e administracao."
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
+
+Resources:
+  VPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProjectName}-vpc"
+
+  InternetGateway:
+    Type: "AWS::EC2::InternetGateway"
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProjectName}-igw"
+
+  AttachGateway:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  SubnetAZ1:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref SubnetAz1Cidr
+      AvailabilityZone: !Ref Az1
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProjectName}-subnet-az1"
+
+  SubnetAZ2:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref SubnetAz2Cidr
+      AvailabilityZone: !Ref Az2
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProjectName}-subnet-az2"
+
+  RouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProjectName}-rt"
+
+  PublicRoute:
+    Type: "AWS::EC2::Route"
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetAssocAZ1:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref SubnetAZ1
+      RouteTableId: !Ref RouteTable
+
+  SubnetAssocAZ2:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref SubnetAZ2
+      RouteTableId: !Ref RouteTable
+
+  # Security Groups
+  FrontSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Security Group para Camada de Front-end e Docker Swarm"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref MyIP }
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 2377, ToPort: 2377, CidrIp: !Ref VpcCidr }
+        - { IpProtocol: tcp, FromPort: 7946, ToPort: 7946, CidrIp: !Ref VpcCidr }
+        - { IpProtocol: udp, FromPort: 7946, ToPort: 7946, CidrIp: !Ref VpcCidr }
+        - { IpProtocol: udp, FromPort: 4789, ToPort: 4789, CidrIp: !Ref VpcCidr }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: !Ref VpcCidr }
+        - { IpProtocol: tcp, FromPort: 15672, ToPort: 15672, CidrIp: !Ref MyIP }
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 0.0.0.0/0 }
+
+  BackSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Security Group para Camada de Back-end e Docker Swarm"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref MyIP }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref FrontSG }
+        - { IpProtocol: tcp, FromPort: 2377, ToPort: 2377, CidrIp: !Ref VpcCidr }
+        - { IpProtocol: tcp, FromPort: 7946, ToPort: 7946, CidrIp: !Ref VpcCidr }
+        - { IpProtocol: udp, FromPort: 7946, ToPort: 7946, CidrIp: !Ref VpcCidr }
+        - { IpProtocol: udp, FromPort: 4789, ToPort: 4789, CidrIp: !Ref VpcCidr }
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 0.0.0.0/0 }
+
+  RabbitMQSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Security Group para Camada RabbitMQ e Docker Swarm"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref MyIP }
+        - { IpProtocol: tcp, FromPort: 5672, ToPort: 5672, CidrIp: !Ref VpcCidr }
+        - { IpProtocol: tcp, FromPort: 15672, ToPort: 15672, CidrIp: !Ref MyIP }
+        - { IpProtocol: tcp, FromPort: 2377, ToPort: 2377, CidrIp: !Ref VpcCidr }
+        - { IpProtocol: tcp, FromPort: 7946, ToPort: 7946, CidrIp: !Ref VpcCidr }
+        - { IpProtocol: udp, FromPort: 7946, ToPort: 7946, CidrIp: !Ref VpcCidr }
+        - { IpProtocol: udp, FromPort: 4789, ToPort: 4789, CidrIp: !Ref VpcCidr }
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 0.0.0.0/0 }
+
+  # MANAGER LEADER
+  FrontEC2AZ1:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      PrivateIpAddress: "10.0.1.10"
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      SubnetId: !Ref SubnetAZ1
+      SecurityGroupIds: [!Ref FrontSG]
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+
+          apt-get update -y
+          apt-get install -y ca-certificates curl python3
+
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          chmod a+r /etc/apt/keyrings/docker.asc
+
+          tee /etc/apt/sources.list.d/docker.sources <<EOF
+          Types: deb
+          URIs: https://download.docker.com/linux/ubuntu
+          Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+          Components: stable
+          Architectures: $(dpkg --print-architecture)
+          Signed-By: /etc/apt/keyrings/docker.asc
+          EOF
+
+          apt-get update -y
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          usermod -aG docker ubuntu
+
+          # Inicializa o Swarm
+          docker swarm init --advertise-addr 10.0.1.10
+
+          WORKER_TOKEN=$(docker swarm join-token worker -q)
+          MANAGER_TOKEN=$(docker swarm join-token manager -q)
+
+          # Prepara o diretorio HTTP
+          mkdir -p /tmp/web
+          echo "WORKER_TOKEN=$WORKER_TOKEN" > /tmp/web/tokens.txt
+          echo "MANAGER_TOKEN=$MANAGER_TOKEN" >> /tmp/web/tokens.txt
+
+          # Inicia servidor HTTP temporario
+          cd /tmp/web
+          nohup python3 -m http.server 8080 > /dev/null 2>&1 &    
+          SERVER_PID=$!
+          (sleep 600 && kill -9 $SERVER_PID) &
+
+          # Criar rede overlay global compartilhada entre os composites
+          docker network create --driver overlay --attachable app-network
+
+          # Criar o docker-compose do RabbitMQ
+          mkdir -p /opt/rabbitmq
+          cat << 'EOF' > /opt/rabbitmq/docker-compose.yml
+          version: '3.8'
+
+          services:
+            rabbitmq:
+              image: rabbitmq:3-management
+              container_name: rabbitmq
+              ports:
+                - "5672:5672"
+                - "15672:15672"
+              environment:
+                RABBITMQ_DEFAULT_USER: "admin"
+                RABBITMQ_DEFAULT_PASS: "admin123"
+              volumes:
+                - rabbitmq_data:/var/lib/rabbitmq
+              networks:
+                - app-network
+              deploy:
+                mode: replicated
+                replicas: 1
+                restart_policy:
+                  condition: on-failure
+
+          networks:
+            app-network:
+              external: true
+
+          volumes:
+            rabbitmq_data:
+              driver: local
+          EOF
+
+          # Executa o deploy da stack RabbitMQ
+          sleep 10
+          docker stack deploy -c /opt/rabbitmq/docker-compose.yml rabbitmq
+
+          # CONFIGURACAO DO SFTP CHROOTED
+          mkdir -p /srv/urubu/data
+          chown root:root /srv/urubu
+          chmod 755 /srv/urubu
+
+          useradd -m -d /srv/urubu/data -s /usr/sbin/nologin urubu_sftp || true
+          chown -R urubu_sftp:urubu_sftp /srv/urubu/data
+
+          # Gera a chave SSH para acesso SFTP caso nao exista
+          ssh-keygen -t ed25519 -f /root/urubusftp -N "" -C "urubu-sftp-key"
+          mkdir -p /srv/urubu/data/.ssh
+          cat /root/urubusftp.pub > /srv/urubu/data/.ssh/authorized_keys
+          chown -R urubu_sftp:urubu_sftp /srv/urubu/data/.ssh
+          chmod 700 /srv/urubu/data/.ssh
+          chmod 600 /srv/urubu/data/.ssh/authorized_keys
+
+          # Atualiza a configuracao do OpenSSH
+          cat << 'EOF' >> /etc/ssh/sshd_config
+
+          Match User urubu_sftp
+              ForceCommand internal-sftp
+              ChrootDirectory /srv/urubu
+              PermitTTY no
+              X11Forwarding no
+              AllowTcpForwarding no
+              AuthorizedKeysFile /srv/urubu/data/.ssh/authorized_keys
+          EOF
+
+          systemctl restart sshd
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProjectName}-front-az1"
+
+  # SECONDARY MANAGER
+  FrontEC2AZ2:
+    Type: "AWS::EC2::Instance"
+    DependsOn: FrontEC2AZ1
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      SubnetId: !Ref SubnetAZ2
+      SecurityGroupIds: [!Ref FrontSG]
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+
+          apt-get update -y
+          apt-get install -y ca-certificates curl
+
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          chmod a+r /etc/apt/keyrings/docker.asc
+
+          tee /etc/apt/sources.list.d/docker.sources <<EOF
+          Types: deb
+          URIs: https://download.docker.com/linux/ubuntu
+          Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+          Components: stable
+          Architectures: $(dpkg --print-architecture)
+          Signed-By: /etc/apt/keyrings/docker.asc
+          EOF
+
+          apt-get update -y
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          usermod -aG docker ubuntu
+
+          until curl -s http://10.0.1.10:8080/tokens.txt -o /tmp/tokens.txt; do sleep 5; done
+
+          source /tmp/tokens.txt
+          docker swarm join --token $MANAGER_TOKEN 10.0.1.10:2377
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProjectName}-front-az2"
+
+  # WORKERS (BACK-END & RABBITMQ)
+  BackEC2AZ1:
+    Type: "AWS::EC2::Instance"
+    DependsOn: FrontEC2AZ1
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      SubnetId: !Ref SubnetAZ1
+      SecurityGroupIds: [!Ref BackSG]
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+
+          apt-get update -y
+          apt-get install -y ca-certificates curl
+
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          chmod a+r /etc/apt/keyrings/docker.asc
+
+          tee /etc/apt/sources.list.d/docker.sources <<EOF
+          Types: deb
+          URIs: https://download.docker.com/linux/ubuntu
+          Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+          Components: stable
+          Architectures: $(dpkg --print-architecture)
+          Signed-By: /etc/apt/keyrings/docker.asc
+          EOF
+
+          apt-get update -y
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          usermod -aG docker ubuntu
+
+          until curl -s http://10.0.1.10:8080/tokens.txt -o /tmp/tokens.txt; do sleep 5; done
+
+          source /tmp/tokens.txt
+          docker swarm join --token $WORKER_TOKEN 10.0.1.10:2377
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProjectName}-back-az1"
+
+  BackEC2AZ2:
+    Type: "AWS::EC2::Instance"
+    DependsOn: FrontEC2AZ1
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      SubnetId: !Ref SubnetAZ2
+      SecurityGroupIds: [!Ref BackSG]
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+
+          apt-get update -y
+          apt-get install -y ca-certificates curl
+
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          chmod a+r /etc/apt/keyrings/docker.asc
+
+          tee /etc/apt/sources.list.d/docker.sources <<EOF
+          Types: deb
+          URIs: https://download.docker.com/linux/ubuntu
+          Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+          Components: stable
+          Architectures: $(dpkg --print-architecture)
+          Signed-By: /etc/apt/keyrings/docker.asc
+          EOF
+
+          apt-get update -y
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          usermod -aG docker ubuntu
+
+          until curl -s http://10.0.1.10:8080/tokens.txt -o /tmp/tokens.txt; do sleep 5; done
+
+          source /tmp/tokens.txt
+          docker swarm join --token $WORKER_TOKEN 10.0.1.10:2377
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProjectName}-back-az2"
+
+  RabbitMQEC2AZ1:
+    Type: "AWS::EC2::Instance"
+    DependsOn: FrontEC2AZ1
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      SubnetId: !Ref SubnetAZ1
+      SecurityGroupIds: [!Ref RabbitMQSG]
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+
+          apt-get update -y
+          apt-get install -y ca-certificates curl
+
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          chmod a+r /etc/apt/keyrings/docker.asc
+
+          tee /etc/apt/sources.list.d/docker.sources <<EOF
+          Types: deb
+          URIs: https://download.docker.com/linux/ubuntu
+          Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+          Components: stable
+          Architectures: $(dpkg --print-architecture)
+          Signed-By: /etc/apt/keyrings/docker.asc
+          EOF
+
+          apt-get update -y
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          usermod -aG docker ubuntu
+
+          until curl -s http://10.0.1.10:8080/tokens.txt -o /tmp/tokens.txt; do sleep 5; done
+
+          source /tmp/tokens.txt
+          docker swarm join --token $WORKER_TOKEN 10.0.1.10:2377
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProjectName}-rabbitmq-az1"
+
+  RabbitMQEC2AZ2:
+    Type: "AWS::EC2::Instance"
+    DependsOn: FrontEC2AZ1
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      SubnetId: !Ref SubnetAZ2
+      SecurityGroupIds: [!Ref RabbitMQSG]
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -e
+
+          apt-get update -y
+          apt-get install -y ca-certificates curl
+
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          chmod a+r /etc/apt/keyrings/docker.asc
+
+          tee /etc/apt/sources.list.d/docker.sources <<EOF
+          Types: deb
+          URIs: https://download.docker.com/linux/ubuntu
+          Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+          Components: stable
+          Architectures: $(dpkg --print-architecture)
+          Signed-By: /etc/apt/keyrings/docker.asc
+          EOF
+
+          apt-get update -y
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          usermod -aG docker ubuntu
+
+          until curl -s http://10.0.1.10:8080/tokens.txt -o /tmp/tokens.txt; do sleep 5; done
+
+          source /tmp/tokens.txt
+          docker swarm join --token $WORKER_TOKEN 10.0.1.10:2377
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-${ProjectName}-rabbitmq-az2"
+
+  # Elastic IPs
+  EIPFront1:
+    Type: "AWS::EC2::EIP"
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref FrontEC2AZ1
+
+  EIPFront2:
+    Type: "AWS::EC2::EIP"
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref FrontEC2AZ2
+
+Outputs:
+  VpcId:
+    Description: "ID da VPC criada"
+    Value: !Ref VPC
+  Front1PublicIp:
+    Description: "IP Elastico do Front-end na AZ1"
+    Value: !Ref EIPFront1
+  Front2PublicIp:
+    Description: "IP Elastico do Front-end na AZ2"
+    Value: !Ref EIPFront2
+  RabbitMQManagementUrl:
+    Description: "URL de Acesso ao Painel do RabbitMQ (Utilize admin/admin123)"
+    Value: !Sub "http://${EIPFront1}:15672"
