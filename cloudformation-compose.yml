@@ -31,8 +31,10 @@ Parameters:
     Description: Tag publicada para as três imagens da aplicação.
   AdminCidr:
     Type: String
-    Default: 127.0.0.1/32
-    Description: CIDR autorizado a acessar os painéis WAHA e RabbitMQ.
+    MinLength: 9
+    Description: >-
+      CIDR autorizado a acessar os painéis WAHA (3000) e RabbitMQ (15672).
+      Informe o seu IP público, ex.: 203.0.113.10/32.
 
 Resources:
   VPC:
@@ -90,6 +92,22 @@ Resources:
     Properties:
       SubnetId: !Ref PublicSubnet
       RouteTableId: !Ref PublicRouteTable
+
+  # IP público fixo: mantém CORS (FRONTEND_ORIGIN) e URLs estáveis entre stop/start.
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-eip"
+
+  ElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ElasticIp.AllocationId
+      InstanceId: !Ref AppInstance
 
   AppSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -190,9 +208,6 @@ Resources:
           apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
           systemctl enable --now docker
 
-          IMDS_TOKEN="$(curl -fsS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')"
-          PUBLIC_IP="$(curl -fsS -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)"
-
           install -d -m 0700 /opt/studio-many
           cd /opt/studio-many
           MYSQL_ROOT_PASSWORD="$(openssl rand -hex 32)"
@@ -213,7 +228,7 @@ Resources:
           WAHA_DASHBOARD_USERNAME=admin
           WAHA_DASHBOARD_PASSWORD=$WAHA_DASHBOARD_PASSWORD
           JWT_SECRET=$JWT_SECRET
-          FRONTEND_ORIGIN=http://$PUBLIC_IP
+          FRONTEND_ORIGIN=http://${ElasticIp}
           ENV_FILE
           chmod 0600 .env
 
@@ -280,7 +295,8 @@ Resources:
                 SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
                 SPRING_DATASOURCE_USERNAME: ${!MYSQL_USER}
                 SPRING_DATASOURCE_PASSWORD: ${!MYSQL_PASSWORD}
-                SPRING_SQL_INIT_MODE: never
+                SPRING_SQL_INIT_MODE: "always"
+                SPRING_SQL_INIT_DATA_LOCATIONS: classpath:data-mysql.sql
                 SPRING_H2_CONSOLE_ENABLED: "false"
                 JWT_SECRET: ${!JWT_SECRET}
                 JWT_VALIDITY: "3600"
@@ -341,17 +357,17 @@ Outputs:
     Description: EC2 instance running Docker Compose
     Value: !Ref AppInstance
   PublicIp:
-    Description: Public IP for the frontend and API
-    Value: !GetAtt AppInstance.PublicIp
+    Description: Elastic IP fixo da instância (frontend e API)
+    Value: !Ref ElasticIp
   FrontendUrl:
     Description: Frontend HTTP endpoint
-    Value: !Sub "http://${AppInstance.PublicIp}"
+    Value: !Sub "http://${ElasticIp}"
   BackendSwaggerUrl:
     Description: Backend Swagger UI
-    Value: !Sub "http://${AppInstance.PublicIp}:8080/swagger-ui/index.html"
+    Value: !Sub "http://${ElasticIp}:8080/swagger-ui/index.html"
   WahaDashboardUrl:
     Description: WAHA dashboard (restricted to AdminCidr)
-    Value: !Sub "http://${AppInstance.PublicIp}:3000"
+    Value: !Sub "http://${ElasticIp}:3000"
   RabbitMqManagementUrl:
     Description: RabbitMQ management (restricted to AdminCidr)
-    Value: !Sub "http://${AppInstance.PublicIp}:15672"
+    Value: !Sub "http://${ElasticIp}:15672"
