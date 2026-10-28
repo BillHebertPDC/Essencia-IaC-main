@@ -1,0 +1,734 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Template CloudFormation com VPC, 2 Subnets, Docker Swarm automatizado (2 Managers + 4 Workers) e SFTP configurado."
+
+# Parametro tecnico (invisivel): resolve o AMI Ubuntu 24.04 mais estavel no deploy.
+# Nao e input de wizard -- tem Default e e resolvido automaticamente pelo CloudFormation.
+Parameters:
+  ImageId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
+
+Resources:
+  # Usa o instance profile existente do ambiente (AWS Academy/LabRole)
+  # para evitar erro de permissao iam:CreateRole.
+
+  VPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: 10.0.0.0/20
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "dev-Essencia-vpc"
+
+  InternetGateway:
+    Type: "AWS::EC2::InternetGateway"
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "dev-Essencia-igw"
+
+  AttachGateway:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  SubnetAZ1:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: us-east-1a
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "dev-Essencia-subnet-az1"
+
+  SubnetAZ2:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: us-east-1b
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "dev-Essencia-subnet-az2"
+
+  RouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "dev-Essencia-rt"
+
+  PublicRoute:
+    Type: "AWS::EC2::Route"
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetAssocAZ1:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref SubnetAZ1
+      RouteTableId: !Ref RouteTable
+
+  SubnetAssocAZ2:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref SubnetAZ2
+      RouteTableId: !Ref RouteTable
+
+  # Security Groups
+  FrontSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Security Group para Camada de Front-end e Docker Swarm"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 3000, ToPort: 3000, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 3306, ToPort: 3306, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 5672, ToPort: 5672, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 15672, ToPort: 15672, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 8081, ToPort: 8081, CidrIp: 10.0.0.0/20 }
+        - { IpProtocol: tcp, FromPort: 2377, ToPort: 2377, CidrIp: 10.0.0.0/20 }
+        - { IpProtocol: tcp, FromPort: 7946, ToPort: 7946, CidrIp: 10.0.0.0/20 }
+        - { IpProtocol: udp, FromPort: 7946, ToPort: 7946, CidrIp: 10.0.0.0/20 }
+        - { IpProtocol: udp, FromPort: 4789, ToPort: 4789, CidrIp: 10.0.0.0/20 }
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 0.0.0.0/0 }
+
+  BackSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Security Group para Camada de Back-end e Docker Swarm"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 3000, ToPort: 3000, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 15672, ToPort: 15672, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 5672, ToPort: 5672, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 3306, ToPort: 3306, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 2377, ToPort: 2377, CidrIp: 10.0.0.0/20 }
+        - { IpProtocol: tcp, FromPort: 7946, ToPort: 7946, CidrIp: 10.0.0.0/20 }
+        - { IpProtocol: udp, FromPort: 7946, ToPort: 7946, CidrIp: 10.0.0.0/20 }
+        - { IpProtocol: udp, FromPort: 4789, ToPort: 4789, CidrIp: 10.0.0.0/20 }
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 0.0.0.0/0 }
+
+  RabbitMQSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Security Group para Camada RabbitMQ e Docker Swarm"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 3000, ToPort: 3000, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 5672, ToPort: 5672, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 15672, ToPort: 15672, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 3306, ToPort: 3306, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 2377, ToPort: 2377, CidrIp: 10.0.0.0/20 }
+        - { IpProtocol: tcp, FromPort: 7946, ToPort: 7946, CidrIp: 10.0.0.0/20 }
+        - { IpProtocol: udp, FromPort: 7946, ToPort: 7946, CidrIp: 10.0.0.0/20 }
+        - { IpProtocol: udp, FromPort: 4789, ToPort: 4789, CidrIp: 10.0.0.0/20 }
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 0.0.0.0/0 }
+
+  # MANAGER LEADER
+  FrontEC2AZ1:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: t3.large
+      PrivateIpAddress: "10.0.1.10"
+      IamInstanceProfile: LabInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            DeleteOnTermination: true
+      SubnetId: !Ref SubnetAZ1
+      SecurityGroupIds: [!Ref FrontSG]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Aguarda atualizacoes automatizadas do sistema
+          while fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+            sleep 5
+          done
+
+          apt-get update -y
+          apt-get install -y ca-certificates curl python3
+
+          # Instala Docker via script oficial (mais robusto para cloud-init)
+          curl -fsSL https://get.docker.com -o get-docker.sh
+          sh get-docker.sh
+          rm get-docker.sh
+
+          usermod -aG docker ubuntu
+          systemctl enable --now docker
+
+          # Inicializa o Swarm
+          docker swarm init --advertise-addr 10.0.1.10
+
+          WORKER_TOKEN=$(docker swarm join-token worker -q)
+          MANAGER_TOKEN=$(docker swarm join-token manager -q)
+
+          # Prepara o diretorio HTTP
+          mkdir -p /tmp/web
+          echo "WORKER_TOKEN=$WORKER_TOKEN" > /tmp/web/tokens.txt
+          echo "MANAGER_TOKEN=$MANAGER_TOKEN" >> /tmp/web/tokens.txt
+
+          # Inicia servidor HTTP temporario para repassar tokens
+          cd /tmp/web
+          nohup python3 -m http.server 8081 > /dev/null 2>&1 &    
+          SERVER_PID=$!
+          (sleep 1800 && kill -9 $SERVER_PID) &
+
+          # Criar rede overlay global compartilhada entre os composites
+          docker network create --driver overlay --attachable app-network 2>/dev/null || true
+
+          mkdir -p /opt/rabbitmq
+          cat << 'EOF' > /opt/rabbitmq/docker-compose.yml
+          version: '3.8'
+
+          services:
+            mysql:
+              image: mysql:8.4
+              restart: unless-stopped
+              ports:
+                - "127.0.0.1:3306:3306"
+              environment:
+                MYSQL_ROOT_PASSWORD: admin
+                MYSQL_DATABASE: studiomanydb
+                MYSQL_USER: admin
+                MYSQL_PASSWORD: admin
+                TZ: America/Sao_Paulo
+              volumes:
+                - mysql_data:/var/lib/mysql
+              healthcheck:
+                test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -padmin --silent"]
+                interval: 10s
+                timeout: 5s
+                retries: 12
+                start_period: 30s
+              networks:
+                studio-network:
+                  aliases:
+                    - mysql
+
+            rabbitmq:
+              image: rabbitmq:4-management
+              restart: unless-stopped
+              ports:
+                - "127.0.0.1:5672:5672"
+                - "0.0.0.0:15672:15672"
+              environment:
+                RABBITMQ_DEFAULT_USER: admin
+                RABBITMQ_DEFAULT_PASS: admin
+              volumes:
+                - rabbitmq_data:/var/lib/rabbitmq
+              healthcheck:
+                test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+              networks:
+                studio-network:
+                  aliases:
+                    - rabbitmq
+
+            waha:
+              image: devlikeapro/waha:latest
+              restart: unless-stopped
+              ports:
+                - "0.0.0.0:3000:3000"
+              environment:
+                # Desativa toda a autenticacao (demo / "tudo liberado")
+                WAHA_API_KEY: ""
+                WAHA_NO_API_KEY: "True"
+                WHATSAPP_API_KEY: ""
+                WHATSAPP_API_KEY_EXCLUDE_PATH: "health,ping"
+                WAHA_DASHBOARD_USERNAME: admin
+                WAHA_DASHBOARD_PASSWORD: ""
+                WAHA_DASHBOARD_NO_PASSWORD: "True"
+                WHATSAPP_SWAGGER_PASSWORD: ""
+                WHATSAPP_SWAGGER_NO_PASSWORD: "True"
+                WAHA_PRINT_QR: "true"
+                WHATSAPP_DEFAULT_ENGINE: NOWEB
+                WHATSAPP_START_SESSION: "default"
+                WHATSAPP_RESTART_ALL_SESSIONS: "True"
+                TZ: America/Sao_Paulo
+              volumes:
+                - waha_instances:/app/.sessions
+              networks:
+                studio-network:
+                  aliases:
+                    - waha
+
+            studio-many-backend:
+              image: "billhebertpdc/studio-many-backend:latest"
+              restart: unless-stopped
+              healthcheck:
+                test: ["CMD", "wget", "-qO-", "http://localhost:8080/swagger-ui.html"]
+                interval: 30s
+                timeout: 10s
+                retries: 3
+                start_period: 60s
+              ports:
+                - "0.0.0.0:8080:8080"
+              environment:
+                SPRING_DATASOURCE_URL: "jdbc:mysql://essencia_mysql:3306/studiomanydb?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC"
+                SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
+                SPRING_DATASOURCE_USERNAME: admin
+                SPRING_DATASOURCE_PASSWORD: admin
+                SPRING_SQL_INIT_MODE: "always"
+                SPRING_SQL_INIT_DATA_LOCATIONS: "classpath:data-mysql.sql"
+                SPRING_H2_CONSOLE_ENABLED: "false"
+                JWT_SECRET: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+                JWT_VALIDITY: "3600"
+                RABBITMQ_HOST: essencia_rabbitmq
+                RABBITMQ_PORT: "5672"
+                RABBITMQ_USERNAME: admin
+                RABBITMQ_PASSWORD: admin
+                CORS_ALLOWEDORIGINS: "http://localhost:5173"
+                JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=60 -XX:MaxRAM=512m"
+              volumes:
+                - backend_uploads:/app/uploads
+              deploy:
+                resources:
+                  limits:
+                    memory: 1536M
+              depends_on:
+                - mysql
+              networks:
+                studio-network:
+                  aliases:
+                    - studio-many-backend
+
+            essencia-actions-service:
+              image: "billhebertpdc/studio-many-actions-service:latest"
+              restart: unless-stopped
+              environment:
+                RABBITMQ_HOST: essencia_rabbitmq
+                RABBITMQ_PORT: "5672"
+                RABBITMQ_USERNAME: admin
+                RABBITMQ_PASSWORD: admin
+                WAHA_API_URL: http://essencia_waha:3000
+                WAHA_API_KEY: admin
+                WAHA_SESSION: default
+                WHATSAPP_PROVIDER: "waha"
+                JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=60 -XX:MaxRAM=300m"
+              deploy:
+                resources:
+                  limits:
+                    memory: 400M
+              depends_on:
+                - rabbitmq
+                - waha
+              networks:
+                - studio-network
+
+            essencia-front:
+              image: "billhebertpdc/studio-many-front:latest"
+              restart: unless-stopped
+              ports:
+                - "0.0.0.0:80:80"
+              environment:
+                API_BASE_URL: "http://localhost:8080"
+              depends_on:
+                - studio-many-backend
+              networks:
+                - studio-network
+
+          volumes:
+            mysql_data:
+            rabbitmq_data:
+            waha_instances:
+            backend_uploads:
+
+          networks:
+            studio-network:
+              driver: overlay
+              attachable: true
+          EOF
+
+          # Aguarda o cluster Swarm estar pronto
+          sleep 15
+
+          # Garante que a rede overlay exista
+          docker network inspect studio-network >/dev/null 2>&1 || docker network create --driver overlay --attachable studio-network
+
+          # Remove stacks antigas caso existam
+          docker stack rm essencia 2>/dev/null || true
+          docker stack rm rabbitmq 2>/dev/null || true
+          sleep 20
+
+          # Descobre o IP publico da instancia via IMDSv2 (com retry, pois o EIP pode ser associado depois)
+          PUB_IP=""
+          for i in $(seq 1 30); do
+            IMDS_TOKEN=$(curl -s -X PUT --connect-timeout 2 "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300" || true)
+            if [ -n "$IMDS_TOKEN" ]; then
+              PUB_IP=$(curl -fsS --connect-timeout 2 -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 || true)
+            else
+              PUB_IP=$(curl -fsS --connect-timeout 2 http://169.254.169.254/latest/meta-data/public-ipv4 || true)
+            fi
+            if [ -n "$PUB_IP" ]; then break; fi
+            sleep 5
+          done
+          if [[ "$PUB_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            ORIGIN="http://${!PUB_IP},http://${!PUB_IP}:8080"
+          else
+            ORIGIN="http://localhost:5173"
+          fi
+          sed -i "s|CORS_ALLOWEDORIGINS: \"http://localhost:5173\"|CORS_ALLOWEDORIGINS: \"${!ORIGIN}\"|g" /opt/rabbitmq/docker-compose.yml || true
+          sed -i "s|API_BASE_URL: \"http://localhost:8080\"|API_BASE_URL: \"http://${!PUB_IP}:8080\"|g" /opt/rabbitmq/docker-compose.yml || true
+
+          # Executa o deploy da stack completa
+          docker stack deploy --with-registry-auth -c /opt/rabbitmq/docker-compose.yml essencia
+
+          # Aguarda o MySQL estar REALMENTE pronto (ping dentro do proprio container do banco)
+          # "docker service ps" muda para Running cedo demais; o ping real evita matar
+          # o backend no meio do boot ou iniciar contra um banco nao pronto.
+          for i in $(seq 1 60); do
+            CID=$(docker ps -qf name=essencia_mysql | head -n1)
+            if [ -n "$CID" ] && docker exec "$CID" mysqladmin ping -h 127.0.0.1 -u root -padmin --silent 2>/dev/null; then
+              break
+            fi
+            sleep 5
+          done
+          # Reinicia o backend para que ele nasca com o banco ja disponivel
+          docker service update --force essencia_studio-many-backend
+
+          # CONFIGURACAO DO SFTP CHROOTED
+          mkdir -p /srv/urubu/data
+          chown root:root /srv/urubu
+          chmod 755 /srv/urubu
+
+          useradd -m -d /srv/urubu/data -s /usr/sbin/nologin urubu_sftp || true
+          chown -R urubu_sftp:urubu_sftp /srv/urubu/data
+
+          # Gera a chave SSH para acesso SFTP caso nao exista
+          ssh-keygen -t ed25519 -f /root/urubusftp -N "" -C "urubu-sftp-key"
+          mkdir -p /srv/urubu/data/.ssh
+          cat /root/urubusftp.pub > /srv/urubu/data/.ssh/authorized_keys
+          chown -R urubu_sftp:urubu_sftp /srv/urubu/data/.ssh
+          chmod 700 /srv/urubu/data/.ssh
+          chmod 600 /srv/urubu/data/.ssh/authorized_keys
+
+          # Atualiza a configuracao do OpenSSH
+          cat << 'EOF' >> /etc/ssh/sshd_config
+
+          Match User urubu_sftp
+              ForceCommand internal-sftp
+              ChrootDirectory /srv/urubu
+              PermitTTY no
+              X11Forwarding no
+              AllowTcpForwarding no
+              AuthorizedKeysFile /srv/urubu/data/.ssh/authorized_keys
+          EOF
+
+          systemctl daemon-reload || true
+          systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+
+      Tags:
+        - Key: Name
+          Value: !Sub "dev-Essencia-front-az1"
+
+  # SECONDARY MANAGER
+  FrontEC2AZ2:
+    Type: "AWS::EC2::Instance"
+    DependsOn: FrontEC2AZ1
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: t3.large
+      IamInstanceProfile: LabInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            DeleteOnTermination: true
+      SubnetId: !Ref SubnetAZ2
+      SecurityGroupIds: [!Ref FrontSG]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Aguarda atualizacoes automatizadas do sistema
+          while fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+            sleep 5
+          done
+
+          apt-get update -y
+          apt-get install -y ca-certificates curl
+
+          # Instala Docker via script oficial (mais robusto para cloud-init)
+          curl -fsSL https://get.docker.com -o get-docker.sh
+          sh get-docker.sh
+          rm get-docker.sh
+
+          usermod -aG docker ubuntu
+          systemctl enable --now docker
+          docker version > /dev/null 2>&1 || true
+          sleep 5
+          docker info > /dev/null 2>&1 || true
+
+          until curl -s http://10.0.1.10:8081/tokens.txt -o /tmp/tokens.txt; do sleep 5; done
+
+          source /tmp/tokens.txt
+          docker swarm join --token $MANAGER_TOKEN 10.0.1.10:2377
+      Tags:
+        - Key: Name
+          Value: !Sub "dev-Essencia-front-az2"
+
+  # WORKERS (BACK-END & RABBITMQ)
+  BackEC2AZ1:
+    Type: "AWS::EC2::Instance"
+    DependsOn: FrontEC2AZ1
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: t3.large
+      IamInstanceProfile: LabInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            DeleteOnTermination: true
+      SubnetId: !Ref SubnetAZ1
+      SecurityGroupIds: [!Ref BackSG]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Aguarda atualizacoes automatizadas do sistema
+          while fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+            sleep 5
+          done
+
+          apt-get update -y
+          apt-get install -y ca-certificates curl
+
+          # Instala Docker via script oficial (mais robusto para cloud-init)
+          curl -fsSL https://get.docker.com -o get-docker.sh
+          sh get-docker.sh
+          rm get-docker.sh
+
+          usermod -aG docker ubuntu
+          systemctl enable --now docker
+          docker version > /dev/null 2>&1 || true
+          sleep 5
+          docker info > /dev/null 2>&1 || true
+
+          until curl -s http://10.0.1.10:8081/tokens.txt -o /tmp/tokens.txt; do sleep 5; done
+
+          source /tmp/tokens.txt
+          docker swarm join --token $WORKER_TOKEN 10.0.1.10:2377
+      Tags:
+        - Key: Name
+          Value: !Sub "dev-Essencia-back-az1"
+
+  BackEC2AZ2:
+    Type: "AWS::EC2::Instance"
+    DependsOn: FrontEC2AZ1
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: t3.large
+      IamInstanceProfile: LabInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            DeleteOnTermination: true
+      SubnetId: !Ref SubnetAZ2
+      SecurityGroupIds: [!Ref BackSG]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Aguarda atualizacoes automatizadas do sistema
+          while fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+            sleep 5
+          done
+
+          apt-get update -y
+          apt-get install -y ca-certificates curl
+
+          # Instala Docker via script oficial (mais robusto para cloud-init)
+          curl -fsSL https://get.docker.com -o get-docker.sh
+          sh get-docker.sh
+          rm get-docker.sh
+
+          usermod -aG docker ubuntu
+          systemctl enable --now docker
+          docker version > /dev/null 2>&1 || true
+          sleep 5
+          docker info > /dev/null 2>&1 || true
+
+          until curl -s http://10.0.1.10:8081/tokens.txt -o /tmp/tokens.txt; do sleep 5; done
+
+          source /tmp/tokens.txt
+          docker swarm join --token $WORKER_TOKEN 10.0.1.10:2377
+      Tags:
+        - Key: Name
+          Value: !Sub "dev-Essencia-back-az2"
+
+  RabbitMQEC2AZ1:
+    Type: "AWS::EC2::Instance"
+    DependsOn: FrontEC2AZ1
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: t3.large
+      IamInstanceProfile: LabInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            DeleteOnTermination: true
+      SubnetId: !Ref SubnetAZ1
+      SecurityGroupIds: [!Ref RabbitMQSG]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Aguarda atualizacoes automatizadas do sistema
+          while fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+            sleep 5
+          done
+
+          apt-get update -y
+          apt-get install -y ca-certificates curl
+
+          # Instala Docker via script oficial (mais robusto para cloud-init)
+          curl -fsSL https://get.docker.com -o get-docker.sh
+          sh get-docker.sh
+          rm get-docker.sh
+
+          usermod -aG docker ubuntu
+          systemctl enable --now docker
+          docker version > /dev/null 2>&1 || true
+          sleep 5
+          docker info > /dev/null 2>&1 || true
+
+          until curl -s http://10.0.1.10:8081/tokens.txt -o /tmp/tokens.txt; do sleep 5; done
+
+          source /tmp/tokens.txt
+          docker swarm join --token $WORKER_TOKEN 10.0.1.10:2377
+      Tags:
+        - Key: Name
+          Value: !Sub "dev-Essencia-rabbitmq-az1"
+
+  RabbitMQEC2AZ2:
+    Type: "AWS::EC2::Instance"
+    DependsOn: FrontEC2AZ1
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: t3.large
+      IamInstanceProfile: LabInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            DeleteOnTermination: true
+      SubnetId: !Ref SubnetAZ2
+      SecurityGroupIds: [!Ref RabbitMQSG]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Aguarda atualizacoes automatizadas do sistema
+          while fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+            sleep 5
+          done
+
+          apt-get update -y
+          apt-get install -y ca-certificates curl
+
+          # Instala Docker via script oficial (mais robusto para cloud-init)
+          curl -fsSL https://get.docker.com -o get-docker.sh
+          sh get-docker.sh
+          rm get-docker.sh
+
+          usermod -aG docker ubuntu
+          systemctl enable --now docker
+          docker version > /dev/null 2>&1 || true
+          sleep 5
+          docker info > /dev/null 2>&1 || true
+
+          until curl -s http://10.0.1.10:8081/tokens.txt -o /tmp/tokens.txt; do sleep 5; done
+
+          source /tmp/tokens.txt
+          docker swarm join --token $WORKER_TOKEN 10.0.1.10:2377
+      Tags:
+        - Key: Name
+          Value: !Sub "dev-Essencia-rabbitmq-az2"
+
+  # Elastic IPs
+  EIPFront1:
+    Type: "AWS::EC2::EIP"
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref FrontEC2AZ1
+
+  EIPFront2:
+    Type: "AWS::EC2::EIP"
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref FrontEC2AZ2
+
+Outputs:
+  VpcId:
+    Description: "ID da VPC criada"
+    Value: !Ref VPC
+  Front1PublicIp:
+    Description: "IP Elastico do Front-end na AZ1"
+    Value: !Ref EIPFront1
+  Front2PublicIp:
+    Description: "IP Elastico do Front-end na AZ2"
+    Value: !Ref EIPFront2
+  RabbitMQManagementUrl:
+    Description: "URL de Acesso ao Painel do RabbitMQ (Utilize as credenciais configuradas)"
+    Value: !Sub "http://${EIPFront1}:15672"
+  FrontUrl:
+    Description: "URL do front-end"
+    Value: !Sub "http://${EIPFront1}/"
+  BackendUrl:
+    Description: "URL da API do backend"
+    Value: !Sub "http://${EIPFront1}:8080"
+  WahaUrl:
+    Description: "URL do painel do WAHA (credenciais configuradas)"
+    Value: !Sub "http://${EIPFront1}:3000"
