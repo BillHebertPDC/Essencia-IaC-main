@@ -957,6 +957,7 @@ A arquitetura alvo so deve ser considerada implementada quando:
 | Arquivo | Conteudo |
 |---|---|
 | [`diagrams/infraestrutura-completa.mmd`](diagrams/infraestrutura-completa.mmd) | visao unica e detalhada: VPC, AZs, sub-redes, route tables (uma por subnet), os 6 security groups com portas, os 9 EC2 com tipos e volumes raiz/dados, containers (React, Spring Boot, actions-service, WAHA, MySQL, RabbitMQ), EBS Retain, S3/SSM externos e o mapa das stacks CloudFormation |
+| [`diagrams/infraestrutura-visual.mmd`](diagrams/infraestrutura-visual.mmd) | mesma visao no estilo `architecture-beta` (grupos aninhados por AZ/subnet, icones e servicos com arestas direcionais) |
 | [`diagrams/infraestrutura-visual.mmd`](diagrams/infraestrutura-visual.mmd) | mesma visao em estilo `architecture-beta` (grupos com icone + servicos + arestas ancoradas); requer renderizador com a extensao Mermaid Architecture (kroki.io e a extensao "Mermaid Architecture" do VS Code suportam) |
 | [`diagrams/architecture.mmd`](diagrams/architecture.mmd) | topologia completa, AZs, gateways, managers, workers, dados e rotas |
 | [`diagrams/request-sequence.mmd`](diagrams/request-sequence.mmd) | requisicao do cliente passando por EIP, Nginx, Swarm e dados |
