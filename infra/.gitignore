@@ -11,3 +11,6 @@
 /scripts/deploy-all.ps1
 /swarm/deploy-stack.sh
 /swarm/studio-essencia-stack.yml
+
+# nota pessoal de build/push de imagens (fora do escopo do IaC)
+/deploy.txt
