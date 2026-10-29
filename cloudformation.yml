@@ -220,7 +220,7 @@ Resources:
                 - "127.0.0.1:3306:3306"
               environment:
                 MYSQL_ROOT_PASSWORD: admin
-                MYSQL_DATABASE: studiomanydb
+                MYSQL_DATABASE: studioessencia
                 MYSQL_USER: admin
                 MYSQL_PASSWORD: admin
                 TZ: America/Sao_Paulo
@@ -286,8 +286,8 @@ Resources:
                   aliases:
                     - waha
 
-            studio-many-backend:
-              image: "billhebertpdc/studio-many-backend:latest"
+            studio-essencia-backend:
+              image: "billhebertpdc/studio-essencia-backend:latest"
               restart: unless-stopped
               healthcheck:
                 test: ["CMD", "wget", "-qO-", "http://localhost:8080/swagger-ui.html"]
@@ -298,13 +298,13 @@ Resources:
               ports:
                 - "0.0.0.0:8080:8080"
               environment:
-                SPRING_DATASOURCE_URL: "jdbc:mysql://essencia_mysql:3306/studiomanydb?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC"
+                SPRING_DATASOURCE_URL: "jdbc:mysql://essencia_mysql:3306/studioessencia?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=America/Sao_Paulo"
                 SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
                 SPRING_DATASOURCE_USERNAME: admin
                 SPRING_DATASOURCE_PASSWORD: admin
+                SPRING_JPA_DDL_AUTO: "none"
                 SPRING_SQL_INIT_MODE: "always"
-                SPRING_SQL_INIT_DATA_LOCATIONS: "classpath:data-mysql.sql"
-                SPRING_H2_CONSOLE_ENABLED: "false"
+                SPRING_SQL_INIT_DATA_LOCATIONS: "classpath:db/init.sql"
                 JWT_SECRET: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
                 JWT_VALIDITY: "3600"
                 RABBITMQ_HOST: essencia_rabbitmq
@@ -312,7 +312,8 @@ Resources:
                 RABBITMQ_USERNAME: admin
                 RABBITMQ_PASSWORD: admin
                 CORS_ALLOWEDORIGINS: "http://localhost:5173"
-                JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=60 -XX:MaxRAM=512m"
+                TZ: "America/Sao_Paulo"
+                JAVA_TOOL_OPTIONS: "-Duser.timezone=America/Sao_Paulo -XX:MaxRAMPercentage=60 -XX:MaxRAM=512m"
               volumes:
                 - backend_uploads:/app/uploads
               deploy:
@@ -324,10 +325,10 @@ Resources:
               networks:
                 studio-network:
                   aliases:
-                    - studio-many-backend
+                    - studio-essencia-backend
 
-            essencia-actions-service:
-              image: "billhebertpdc/studio-many-actions-service:latest"
+            studio-essencia-actions-service:
+              image: "billhebertpdc/studio-essencia-actions-service:latest"
               restart: unless-stopped
               environment:
                 RABBITMQ_HOST: essencia_rabbitmq
@@ -349,15 +350,15 @@ Resources:
               networks:
                 - studio-network
 
-            essencia-front:
-              image: "billhebertpdc/studio-many-front:latest"
+            studio-essencia-front:
+              image: "billhebertpdc/studio-essencia-front:latest"
               restart: unless-stopped
               ports:
                 - "0.0.0.0:80:80"
               environment:
                 API_BASE_URL: "http://localhost:8080"
               depends_on:
-                - studio-many-backend
+                - studio-essencia-backend
               networks:
                 - studio-network
 
@@ -418,7 +419,7 @@ Resources:
             sleep 5
           done
           # Reinicia o backend para que ele nasca com o banco ja disponivel
-          docker service update --force essencia_studio-many-backend
+          docker service update --force essencia_studio-essencia-backend
 
           # CONFIGURACAO DO SFTP CHROOTED
           mkdir -p /srv/urubu/data
