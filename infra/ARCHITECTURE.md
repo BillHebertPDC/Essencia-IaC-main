@@ -956,11 +956,12 @@ A arquitetura alvo so deve ser considerada implementada quando:
 
 | Arquivo | Conteudo |
 |---|---|
+| [`diagrams/infraestrutura-completa.mmd`](diagrams/infraestrutura-completa.mmd) | visao unica e detalhada: VPC, AZs, sub-redes, route tables, os 6 security groups com portas, EC2 (gateway/manager/worker/dados), containers (React, Spring Boot, actions-service, WAHA, MySQL, RabbitMQ), EBS, S3, SSM e stacks CloudFormation |
 | [`diagrams/architecture.mmd`](diagrams/architecture.mmd) | topologia completa, AZs, gateways, managers, workers, dados e rotas |
 | [`diagrams/request-sequence.mmd`](diagrams/request-sequence.mmd) | requisicao do cliente passando por EIP, Nginx, Swarm e dados |
 | [`diagrams/failover-sequence.mmd`](diagrams/failover-sequence.mmd) | deteccao, movimento do EIP e atualizacao das rotas |
 
-Os tres arquivos podem ser renderizados no GitHub, GitLab, VS Code com extensao
+Todos os arquivos podem ser renderizados no GitHub, GitLab, VS Code com extensao
 Mermaid ou com a CLI `mmdc`.
 
 ## 14. Referencias
