@@ -1,0 +1,804 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Studio Essencia - cluster alvo: tres managers, workers de aplicacao, MySQL e RabbitMQ dedicados, em sub-redes privadas."
+
+Parameters:
+  NetworkStackName:
+    Type: String
+    Default: studio-network
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: "^[a-zA-Z][-a-zA-Z0-9]*$"
+    Description: "Nome da stack criada com 01-network.yml."
+
+  ProjectName:
+    Type: String
+    Default: studio-essencia
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: "^[a-z][a-z0-9-]*$"
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  GatewayStackName:
+    Type: String
+    Default: studio-gateway
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: "^[a-zA-Z][-a-zA-Z0-9]*$"
+    Description: "Nome da stack criada com 02-gateway.yml. De onde vem o EIP importado."
+
+  KeyName:
+    Type: String
+    Default: ""
+    Description: "Opcional. Key Pair existente para SSH nos nos."
+
+  ManagerInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: "Tipo dos tres managers. t3.micro e o menor viavel para o control plane do lab."
+
+  WorkerInstanceType:
+    Type: String
+    Default: t3.small
+    Description: "Tipo dos workers de aplicacao. t3.small e o minimo recomendado para backend/WAHA; use t3.medium se houver OOM."
+
+  DataInstanceType:
+    Type: String
+    Default: t3.small
+    Description: "Tipo dos nos dedicados de MySQL e RabbitMQ."
+
+  WorkerCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 2
+    Description: "Workers de aplicacao. N+7 instancias; N=2 resulta em 9 running no AWS Academy."
+
+  WorkerMaxSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 2
+    Description: "Limite do Auto Scaling Group. Mantenha 2 para nao passar de 9 instancias running."
+
+  RootVolumeSize:
+    Type: Number
+    Default: 20
+    MinValue: 8
+    MaxValue: 100
+    Description: "Disco raiz de cada no, em GiB. 8 funciona para managers/dados, mas nao acomoda a imagem do WAHA; 20 e o menor valor validado para os workers."
+
+  DataVolumeSize:
+    Type: Number
+    Default: 8
+    MinValue: 8
+    MaxValue: 200
+    Description: "Disco EBS de dados do MySQL e do RabbitMQ, em GiB. O minimo de 8 atende ao laboratorio."
+
+  Manager1PrivateIp:
+    Type: String
+    Default: 10.20.11.10
+    AllowedPattern: "^(([0-9]{1,3}\\.){3}[0-9]{1,3})$"
+
+  Manager2PrivateIp:
+    Type: String
+    Default: 10.20.12.10
+    AllowedPattern: "^(([0-9]{1,3}\\.){3}[0-9]{1,3})$"
+
+  Manager3PrivateIp:
+    Type: String
+    Default: 10.20.13.10
+    AllowedPattern: "^(([0-9]{1,3}\\.){3}[0-9]{1,3})$"
+
+  MySqlPrivateIp:
+    Type: String
+    Default: 10.20.11.20
+    AllowedPattern: "^(([0-9]{1,3}\\.){3}[0-9]{1,3})$"
+
+  RabbitMqPrivateIp:
+    Type: String
+    Default: 10.20.12.20
+    AllowedPattern: "^(([0-9]{1,3}\\.){3}[0-9]{1,3})$"
+
+  MySqlDataVolumeId:
+    Type: String
+    Default: ""
+    Description: "Opcional. Volume EBS existente para /data do MySQL na AZ-A. Vazio cria um novo volume."
+
+  RabbitMqDataVolumeId:
+    Type: String
+    Default: ""
+    Description: "Opcional. Volume EBS existente para /data do RabbitMQ na AZ-B. Vazio cria um novo volume."
+
+  ImageId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
+
+Conditions:
+  HasKeyName: !Not
+    - !Equals
+      - !Ref KeyName
+      - ""
+
+  CreateMySqlDataVolume: !Equals
+    - !Ref MySqlDataVolumeId
+    - ""
+
+  UseExistingMySqlDataVolume: !Not
+    - Condition: CreateMySqlDataVolume
+
+  CreateRabbitMqDataVolume: !Equals
+    - !Ref RabbitMqDataVolumeId
+    - ""
+
+  UseExistingRabbitMqDataVolume: !Not
+    - Condition: CreateRabbitMqDataVolume
+
+Resources:
+  NodeLaunchTemplate:
+    Type: "AWS::EC2::LaunchTemplate"
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: !Ref WorkerInstanceType
+        KeyName: !If
+          - HasKeyName
+          - !Ref KeyName
+          - !Ref "AWS::NoValue"
+        IamInstanceProfile:
+          Name: LabInstanceProfile
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${NetworkStackName}-ClusterSecurityGroupId"
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          InstanceMetadataTags: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: !Ref RootVolumeSize
+              VolumeType: gp3
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+
+              apt_update() {
+                for attempt in $(seq 1 120); do
+                  if apt-get update -y; then
+                    return 0
+                  fi
+                  echo "Aguardando NAT/apt ($attempt/120)..."
+                  sleep 10
+                done
+                return 1
+              }
+
+              install_packages() {
+                for attempt in $(seq 1 30); do
+                  if apt-get install -y "$@"; then
+                    return 0
+                  fi
+                  echo "Tentando instalar pacotes ($attempt/30)..."
+                  sleep 10
+                done
+                return 1
+              }
+
+              mount_data_volume() {
+                DATA_DEVICE=$(blkid -L studio-data || true)
+                ROOT_SOURCE=$(findmnt -n -o SOURCE / || true)
+                ROOT_DISK=""
+                if [ -n "$ROOT_SOURCE" ]; then
+                  ROOT_DISK=$(lsblk -no PKNAME "$ROOT_SOURCE" 2>/dev/null | head -n 1 || true)
+                fi
+                if [ -z "$DATA_DEVICE" ]; then
+                  for attempt in $(seq 1 120); do
+                    DATA_DEVICE=""
+                    for dev in $(lsblk -dpno NAME,TYPE | awk '$2=="disk" {print $1}'); do
+                      if [ "$(basename "$dev")" = "$ROOT_DISK" ]; then
+                        continue
+                      fi
+                      if lsblk -no MOUNTPOINT "$dev" | grep -q '/'; then
+                        continue
+                      fi
+                      if [ "$(lsblk -no NAME "$dev" | wc -l)" -eq 1 ]; then
+                        DATA_DEVICE="$dev"
+                        break
+                      fi
+                    done
+                    if [ -n "$DATA_DEVICE" ]; then
+                      break
+                    fi
+                    echo "Aguardando volume EBS de dados ($attempt/120)..."
+                    sleep 5
+                  done
+                fi
+                if [ -z "$DATA_DEVICE" ]; then
+                  echo "Volume EBS de dados nao encontrado"
+                  exit 1
+                fi
+                if blkid "$DATA_DEVICE" >/dev/null 2>&1; then
+                  e2label "$DATA_DEVICE" studio-data || true
+                else
+                  mkfs.ext4 -F -L studio-data "$DATA_DEVICE"
+                fi
+                mkdir -p /data
+                mountpoint -q /data || mount "$DATA_DEVICE" /data
+                grep -q 'LABEL=studio-data' /etc/fstab || echo 'LABEL=studio-data /data ext4 defaults,nofail 0 2' >> /etc/fstab
+                install -d -m 0770 /data/mysql /data/rabbitmq
+                chown -R 999:999 /data/mysql /data/rabbitmq || true
+              }
+
+              apt_update
+              install_packages ca-certificates curl python3 openssh-server openssh-client e2fsprogs util-linux
+
+              IMDS_TOKEN=""
+              for attempt in $(seq 1 30); do
+                if IMDS_TOKEN=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"); then
+                  break
+                fi
+                echo "Aguardando IMDS ($attempt/30)..."
+                sleep 2
+              done
+              if [ -z "$IMDS_TOKEN" ]; then
+                echo "IMDS indisponivel"
+                exit 1
+              fi
+              INSTANCE_ID=$(curl -fsS -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+              ROLE=""
+              for attempt in $(seq 1 60); do
+                ROLE=$(curl -fsS -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/tags/instance/Role || true)
+                if [ -n "$ROLE" ]; then
+                  break
+                fi
+                echo "Aguardando tag Role no IMDS ($attempt/60)..."
+                sleep 5
+              done
+              if [ -z "$ROLE" ]; then
+                echo "Tag Role ausente; habilite InstanceMetadataTags"
+                exit 1
+              fi
+
+              case "$ROLE" in
+                manager-1) HOSTNAME=manager-1 ;;
+                manager-2) HOSTNAME=manager-2 ;;
+                manager-3) HOSTNAME=manager-3 ;;
+                app) HOSTNAME="app-worker-$INSTANCE_ID" ;;
+                mysql) HOSTNAME=mysql-data ;;
+                rabbitmq) HOSTNAME=rabbitmq-data ;;
+                *)
+                  echo "Role invalido ou ausente: $ROLE"
+                  exit 1
+                  ;;
+              esac
+              hostnamectl set-hostname "$HOSTNAME"
+
+              if [ "$ROLE" = "mysql" ] || [ "$ROLE" = "rabbitmq" ]; then
+                mount_data_volume
+              fi
+
+              DOCKER_OK=false
+              for attempt in $(seq 1 30); do
+                if curl -fsSL https://get.docker.com -o /tmp/get-docker.sh; then
+                  if sh /tmp/get-docker.sh; then
+                    DOCKER_OK=true
+                    break
+                  fi
+                fi
+                echo "Tentando instalar Docker ($attempt/30)..."
+                sleep 10
+              done
+              if [ "$DOCKER_OK" != "true" ]; then
+                echo "Falha ao instalar Docker"
+                exit 1
+              fi
+              usermod -aG docker ubuntu || true
+              systemctl enable --now docker
+
+              MANAGER1_IP="${Manager1PrivateIp}"
+              MANAGER2_IP="${Manager2PrivateIp}"
+              MANAGER3_IP="${Manager3PrivateIp}"
+
+              install_token_service() {
+                install -d -m 0700 /opt/swarm
+                docker swarm join-token -q worker > /opt/swarm/worker-token
+                docker swarm join-token -q manager > /opt/swarm/manager-token
+                chmod 0600 /opt/swarm/worker-token /opt/swarm/manager-token
+
+                cat >/etc/systemd/system/swarm-token.service <<'UNIT'
+              [Unit]
+              Description=Studio Essencia - token interno do Docker Swarm
+              After=network-online.target docker.service
+              Wants=network-online.target
+
+              [Service]
+              Type=simple
+              WorkingDirectory=/opt/swarm
+              ExecStart=/usr/bin/python3 -m http.server 8081 --bind 0.0.0.0
+              Restart=always
+              User=root
+              NoNewPrivileges=true
+              PrivateTmp=true
+
+              [Install]
+              WantedBy=multi-user.target
+              UNIT
+
+                systemctl daemon-reload
+                systemctl enable --now swarm-token.service
+              }
+
+              install_labeler() {
+                cat >/usr/local/bin/swarm-labeler.sh <<'LABELER'
+              #!/bin/bash
+              set -u
+              while true; do
+                if docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null | grep -q active; then
+                  for node in $(docker node ls --format '{{.ID}}' 2>/dev/null || true); do
+                    hostname=$(docker node inspect "$node" --format '{{.Description.Hostname}}' 2>/dev/null || true)
+                    case "$hostname" in
+                      app-worker-*) role=app ;;
+                      mysql-data) role=database ;;
+                      rabbitmq-data) role=rabbitmq ;;
+                      manager-*) role=manager ;;
+                      *) continue ;;
+                    esac
+                    current=$(docker node inspect "$node" --format '{{index .Spec.Labels "role"}}' 2>/dev/null || true)
+                    if [ "$current" != "$role" ]; then
+                      docker node update --label-add "role=$role" "$node" >/dev/null 2>&1 || true
+                    fi
+                  done
+                fi
+                sleep 30
+              done
+              LABELER
+                chmod 0755 /usr/local/bin/swarm-labeler.sh
+
+                cat >/etc/systemd/system/swarm-labeler.service <<'UNIT'
+              [Unit]
+              Description=Studio Essencia - rotulador automatico dos nos
+              After=network-online.target docker.service
+              Wants=network-online.target
+
+              [Service]
+              Type=simple
+              ExecStart=/usr/local/bin/swarm-labeler.sh
+              Restart=always
+              User=root
+              NoNewPrivileges=true
+              PrivateTmp=true
+
+              [Install]
+              WantedBy=multi-user.target
+              UNIT
+
+                systemctl daemon-reload
+                systemctl enable --now swarm-labeler.service
+              }
+
+              install_sftp() {
+                mkdir -p /srv/urubu/data
+                chown root:root /srv/urubu
+                chmod 0755 /srv/urubu
+                useradd -m -d /srv/urubu/data -s /usr/sbin/nologin urubu_sftp || true
+                chown -R urubu_sftp:urubu_sftp /srv/urubu/data
+
+                if [ ! -f /root/urubusftp ]; then
+                  ssh-keygen -t ed25519 -f /root/urubusftp -N "" -C "urubu-sftp-key"
+                fi
+
+                mkdir -p /srv/urubu/data/.ssh
+                cat /root/urubusftp.pub > /srv/urubu/data/.ssh/authorized_keys
+                chown -R urubu_sftp:urubu_sftp /srv/urubu/data/.ssh
+                chmod 0700 /srv/urubu/data/.ssh
+                chmod 0600 /srv/urubu/data/.ssh/authorized_keys
+
+                if ! grep -q '^Match User urubu_sftp' /etc/ssh/sshd_config; then
+                  cat >> /etc/ssh/sshd_config <<'SFTP'
+
+              Match User urubu_sftp
+                  ForceCommand internal-sftp
+                  ChrootDirectory /srv/urubu
+                  PermitTTY no
+                  X11Forwarding no
+                  AllowTcpForwarding no
+                  AuthorizedKeysFile .ssh/authorized_keys
+              SFTP
+                fi
+
+                systemctl daemon-reload
+                systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+              }
+
+              get_worker_token() {
+                for attempt in $(seq 1 180); do
+                  for manager_ip in "$MANAGER1_IP" "$MANAGER2_IP" "$MANAGER3_IP"; do
+                    if curl -fsS "http://$manager_ip:8081/worker-token" -o /tmp/worker-token; then
+                      cat /tmp/worker-token
+                      return 0
+                    fi
+                  done
+                  echo "Aguardando token de worker ($attempt/180)..."
+                  sleep 5
+                done
+                return 1
+              }
+
+              join_as_worker() {
+                WORKER_TOKEN=$(get_worker_token) || {
+                  echo "Nao foi possivel obter o worker token"
+                  exit 1
+                }
+
+                for attempt in $(seq 1 60); do
+                  if [ "$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || true)" = "active" ]; then
+                    return 0
+                  fi
+                  for manager_ip in "$MANAGER1_IP" "$MANAGER2_IP" "$MANAGER3_IP"; do
+                    if docker swarm join --token "$WORKER_TOKEN" "$manager_ip:2377"; then
+                      return 0
+                    fi
+                  done
+                  echo "Tentando entrar no Swarm ($attempt/60)..."
+                  sleep 5
+                done
+                return 1
+              }
+
+              publish_application() {
+                mkdir -p /opt/studio
+                printf %s '${AppPayload}' | base64 -d | python3 -c 'import sys,lzma;open("/opt/studio/d.sh","wb").write(lzma.decompress(sys.stdin.buffer.read()))'
+                bash /opt/studio/d.sh "${PublicHost}"
+              }
+
+              case "$ROLE" in
+                manager-1)
+                  if [ "$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || true)" != "active" ]; then
+                    docker swarm init \
+                      --advertise-addr "$MANAGER1_IP" \
+                      --default-addr-pool 172.30.0.0/16 \
+                      --default-addr-pool-mask-length 24
+                  fi
+                  install_token_service
+                  install_labeler
+                  install_sftp
+                  publish_application
+                  ;;
+                manager-2|manager-3)
+                  MANAGER_TOKEN=""
+                  for attempt in $(seq 1 180); do
+                    if curl -fsS "http://$MANAGER1_IP:8081/manager-token" -o /tmp/manager-token; then
+                      MANAGER_TOKEN=$(cat /tmp/manager-token)
+                      break
+                    fi
+                    echo "Aguardando token de manager ($attempt/180)..."
+                    sleep 5
+                  done
+                  if [ -z "$MANAGER_TOKEN" ]; then
+                    echo "Nao foi possivel obter o manager token"
+                    exit 1
+                  fi
+
+                  if [ "$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || true)" != "active" ]; then
+                    JOINED=false
+                    for attempt in $(seq 1 60); do
+                      if docker swarm join --token "$MANAGER_TOKEN" "$MANAGER1_IP:2377"; then
+                        JOINED=true
+                        break
+                      fi
+                      echo "Tentando entrar como manager ($attempt/60)..."
+                      sleep 5
+                    done
+                    if [ "$JOINED" != "true" ]; then
+                      echo "Falha ao entrar como manager"
+                      exit 1
+                    fi
+                  fi
+                  install_token_service
+                  install_labeler
+                  ;;
+                app|mysql|rabbitmq)
+                  join_as_worker
+                  ;;
+              esac
+
+              echo "Bootstrap concluido: role=$ROLE hostname=$HOSTNAME"
+            - Manager1PrivateIp: !Ref Manager1PrivateIp
+              Manager2PrivateIp: !Ref Manager2PrivateIp
+              Manager3PrivateIp: !Ref Manager3PrivateIp
+              PublicHost: !ImportValue
+                Fn::Sub: "${GatewayStackName}-PublicIp"
+              AppPayload: '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'
+
+  Manager1:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      InstanceType: !Ref ManagerInstanceType
+      SubnetId: !ImportValue
+        Fn::Sub: "${NetworkStackName}-PrivateSubnet1Id"
+      PrivateIpAddress: !Ref Manager1PrivateIp
+      SecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: "${NetworkStackName}-ClusterSecurityGroupId"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-manager-1"
+        - Key: Role
+          Value: manager-1
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  Manager2:
+    Type: "AWS::EC2::Instance"
+    DependsOn: Manager1
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      InstanceType: !Ref ManagerInstanceType
+      SubnetId: !ImportValue
+        Fn::Sub: "${NetworkStackName}-PrivateSubnet2Id"
+      PrivateIpAddress: !Ref Manager2PrivateIp
+      SecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: "${NetworkStackName}-ClusterSecurityGroupId"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-manager-2"
+        - Key: Role
+          Value: manager-2
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  Manager3:
+    Type: "AWS::EC2::Instance"
+    DependsOn: Manager1
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      InstanceType: !Ref ManagerInstanceType
+      SubnetId: !ImportValue
+        Fn::Sub: "${NetworkStackName}-PrivateSubnet3Id"
+      PrivateIpAddress: !Ref Manager3PrivateIp
+      SecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: "${NetworkStackName}-ClusterSecurityGroupId"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-manager-3"
+        - Key: Role
+          Value: manager-3
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  AppWorkerAutoScalingGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    DependsOn:
+      - Manager1
+      - Manager2
+      - Manager3
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: !Ref WorkerMaxSize
+      DesiredCapacity: !Ref WorkerCount
+      VPCZoneIdentifier:
+        - !ImportValue
+          Fn::Sub: "${NetworkStackName}-PrivateSubnet1Id"
+        - !ImportValue
+          Fn::Sub: "${NetworkStackName}-PrivateSubnet2Id"
+        - !ImportValue
+          Fn::Sub: "${NetworkStackName}-PrivateSubnet3Id"
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 900
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-app-worker"
+          PropagateAtLaunch: true
+        - Key: Role
+          Value: app
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: !Ref ProjectName
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: true
+
+  MySqlDataVolume:
+    Type: "AWS::EC2::Volume"
+    Condition: CreateMySqlDataVolume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Size: !Ref DataVolumeSize
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-mysql-data"
+        - Key: Role
+          Value: mysql-data
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  RabbitMqDataVolume:
+    Type: "AWS::EC2::Volume"
+    Condition: CreateRabbitMqDataVolume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Size: !Ref DataVolumeSize
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-rabbitmq-data"
+        - Key: Role
+          Value: rabbitmq-data
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  MySqlNode:
+    Type: "AWS::EC2::Instance"
+    DependsOn: Manager1
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      InstanceType: !Ref DataInstanceType
+      SubnetId: !ImportValue
+        Fn::Sub: "${NetworkStackName}-PrivateSubnet1Id"
+      PrivateIpAddress: !Ref MySqlPrivateIp
+      SecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: "${NetworkStackName}-ClusterSecurityGroupId"
+        - !ImportValue
+          Fn::Sub: "${NetworkStackName}-DatabaseSecurityGroupId"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-mysql"
+        - Key: Role
+          Value: mysql
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  MySqlVolumeAttachment:
+    Type: "AWS::EC2::VolumeAttachment"
+    Condition: CreateMySqlDataVolume
+    Properties:
+      InstanceId: !Ref MySqlNode
+      VolumeId: !Ref MySqlDataVolume
+      Device: /dev/sdf
+
+  MySqlExistingVolumeAttachment:
+    Type: "AWS::EC2::VolumeAttachment"
+    Condition: UseExistingMySqlDataVolume
+    Properties:
+      InstanceId: !Ref MySqlNode
+      VolumeId: !Ref MySqlDataVolumeId
+      Device: /dev/sdf
+
+  RabbitMqNode:
+    Type: "AWS::EC2::Instance"
+    DependsOn: Manager1
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      InstanceType: !Ref DataInstanceType
+      SubnetId: !ImportValue
+        Fn::Sub: "${NetworkStackName}-PrivateSubnet2Id"
+      PrivateIpAddress: !Ref RabbitMqPrivateIp
+      SecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: "${NetworkStackName}-ClusterSecurityGroupId"
+        - !ImportValue
+          Fn::Sub: "${NetworkStackName}-RabbitMqSecurityGroupId"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-rabbitmq"
+        - Key: Role
+          Value: rabbitmq
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  RabbitMqVolumeAttachment:
+    Type: "AWS::EC2::VolumeAttachment"
+    Condition: CreateRabbitMqDataVolume
+    Properties:
+      InstanceId: !Ref RabbitMqNode
+      VolumeId: !Ref RabbitMqDataVolume
+      Device: /dev/sdf
+
+  RabbitMqExistingVolumeAttachment:
+    Type: "AWS::EC2::VolumeAttachment"
+    Condition: UseExistingRabbitMqDataVolume
+    Properties:
+      InstanceId: !Ref RabbitMqNode
+      VolumeId: !Ref RabbitMqDataVolumeId
+      Device: /dev/sdf
+
+Outputs:
+  Manager1InstanceId:
+    Description: "ID do manager 1"
+    Value: !Ref Manager1
+
+  Manager2InstanceId:
+    Description: "ID do manager 2"
+    Value: !Ref Manager2
+
+  Manager3InstanceId:
+    Description: "ID do manager 3"
+    Value: !Ref Manager3
+
+  Manager1PrivateIp:
+    Description: "IP privado do manager 1"
+    Value: !Ref Manager1PrivateIp
+
+  Manager2PrivateIp:
+    Description: "IP privado do manager 2"
+    Value: !Ref Manager2PrivateIp
+
+  Manager3PrivateIp:
+    Description: "IP privado do manager 3"
+    Value: !Ref Manager3PrivateIp
+
+  MySqlPrivateIp:
+    Description: "IP privado do MySQL"
+    Value: !Ref MySqlPrivateIp
+
+  RabbitMqPrivateIp:
+    Description: "IP privado do RabbitMQ"
+    Value: !Ref RabbitMqPrivateIp
+
+  MySqlVolumeId:
+    Description: "Volume EBS do MySQL (retido na exclusao da stack)"
+    Condition: CreateMySqlDataVolume
+    Value: !Ref MySqlDataVolume
+
+  RabbitMqVolumeId:
+    Description: "Volume EBS do RabbitMQ (retido na exclusao da stack)"
+    Condition: CreateRabbitMqDataVolume
+    Value: !Ref RabbitMqDataVolume
+
+  AppWorkerAutoScalingGroupName:
+    Description: "Auto Scaling Group dos workers de aplicacao"
+    Value: !Ref AppWorkerAutoScalingGroup
+
+  WorkerCount:
+    Description: "Quantidade desejada de workers de aplicacao"
+    Value: !Ref WorkerCount

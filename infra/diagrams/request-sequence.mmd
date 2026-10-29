@@ -1,0 +1,38 @@
+sequenceDiagram
+    autonumber
+    actor C as Cliente
+    participant EIP as Elastic IP
+    participant GW as Gateway ativo - Nginx
+    participant M1 as Manager 1 - AZ-A
+    participant M2 as Manager 2 - AZ-B
+    participant S as Servico no worker
+    participant DB as MySQL
+    participant MQ as RabbitMQ
+
+    C->>EIP: GET http://EIP:8080/api/...
+    EIP->>GW: TCP 8080
+    Note over C,GW: 80/8080: AllowedWebCidr<br/>15672/3000: AllowedAdminCidr
+    GW->>GW: escolhe upstream e aplica regras
+
+    alt Manager 1 saudavel
+        GW->>M1: proxy_pass 10.20.11.10:8080
+        M1->>S: Swarm ingress na porta 8080
+        S->>DB: SQL
+        DB-->>S: resultado
+        S->>MQ: publica evento AMQP
+        MQ-->>S: confirmacao
+        S-->>M1: resposta HTTP
+        M1-->>GW: resposta HTTP
+    else Manager 1 indisponivel
+        GW->>M2: retry para 10.20.12.10:8080
+        M2->>S: Swarm ingress na porta 8080
+        S->>DB: SQL
+        DB-->>S: resultado
+        S->>MQ: publica evento AMQP
+        MQ-->>S: confirmacao
+        S-->>M2: resposta HTTP
+        M2-->>GW: resposta HTTP
+    end
+
+    GW-->>C: resposta HTTP
+    Note over C,S: Para a porta 80, o fluxo e o mesmo ate o servico,<br/>e DB e RabbitMQ so entram quando a API precisar.

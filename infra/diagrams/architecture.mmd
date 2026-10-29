@@ -1,0 +1,69 @@
+flowchart TB
+    Client["Cliente<br/>HTTP/HTTPS"]
+    EIP["Elastic IP unico<br/>(ativo)"]
+    Internet(("Internet"))
+    CTRL["Agente de failover<br/>na gateway reserva"]
+
+    subgraph AWS["AWS - regiao"]
+        IGW["Internet Gateway"]
+
+        subgraph PUBLIC["Sub-redes publicas - somente gateways"]
+            GW1["Gateway ativo<br/>EC2 Nginx + NAT<br/>AZ-A"]
+            GW2["Gateway reserva<br/>EC2 Nginx + NAT<br/>AZ-B"]
+        end
+
+        subgraph PRIVATE["Sub-redes privadas - cluster e dados"]
+            subgraph AZA["AZ-A"]
+                M1["Manager 1<br/>10.20.11.10"]
+                W1["Workers<br/>(parte dos N)"]
+                DB["MySQL<br/>worker dedicado<br/>10.20.11.20"]
+            end
+
+            subgraph AZB["AZ-B"]
+                M2["Manager 2<br/>10.20.12.10"]
+                W2["Workers<br/>(parte dos N)"]
+                MQ["RabbitMQ<br/>worker dedicado<br/>10.20.12.20"]
+            end
+
+            subgraph AZC["AZ-C"]
+                M3["Manager 3<br/>10.20.13.10"]
+                W3["Workers<br/>(parte dos N)"]
+            end
+        end
+
+        RT["Route tables privadas<br/>0.0.0.0/0 -> gateway ativo"]
+    end
+
+    Client --> EIP
+    EIP --> GW1
+    EIP -. "failover: mesmo IP" .-> GW2
+
+    GW1 -->|"Nginx :80/:8080/:15672/:3000"| M1
+    GW1 --> M2
+    GW1 --> M3
+    GW2 -. "standby" .-> M1
+    GW2 -. "standby" .-> M2
+    GW2 -. "standby" .-> M3
+
+    M1 --- W1
+    M2 --- W2
+    M3 --- W3
+
+    W1 --> DB
+    W2 --> DB
+    W3 --> DB
+    W1 --> MQ
+    W2 --> MQ
+    W3 --> MQ
+
+    RT --> GW1
+    RT -. "failover" .-> GW2
+
+    GW1 -->|"NAT / egress"| IGW
+    GW2 -. "NAT / egress" .-> IGW
+    IGW --> Internet
+
+    CTRL -. "move EIP" .-> EIP
+    CTRL -. "substitui rotas" .-> RT
+    CTRL -. "health check" .-> GW1
+    GW2 --- CTRL

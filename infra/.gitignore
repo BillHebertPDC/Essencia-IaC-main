@@ -1,0 +1,13 @@
+# Chaves e arquivos locais de deploy
+*.pem
+.env
+.env.*
+.tmp-userdata/
+
+# Mantidos fora do repositorio: fluxo escolhido e o console, e ha fontes
+# duplicadas/legadas (referenciaveis no historico, se necessario)
+/legacy/
+/STEP-BY-STEP.md
+/scripts/deploy-all.ps1
+/swarm/deploy-stack.sh
+/swarm/studio-essencia-stack.yml

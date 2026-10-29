@@ -1,0 +1,18 @@
+sequenceDiagram
+    autonumber
+    participant AG as Agente na GW2
+    participant GW1 as Gateway ativo - AZ-A
+    participant EIP as Elastic IP
+    participant GW2 as Gateway reserva - AZ-B
+    participant RT as Route tables privadas
+
+    AG->>GW1: health check TCP 80
+    GW1-->>AG: sem resposta / falha
+    AG->>AG: confirma FailureThreshold
+    AG->>EIP: desassocia o EIP da GW1
+    AG->>GW2: associa o EIP a GW2
+    AG->>GW2: anexa o SG publico e remove da GW1
+    AG->>RT: atualiza 0.0.0.0/0 para GW2
+
+    Note over EIP,RT: conexoes existentes caem,<br/>e novas conexoes entram e saem pela GW2
+

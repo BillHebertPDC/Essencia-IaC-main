@@ -1,0 +1,1237 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Studio Essencia - dois gateways ativo/reserva com Nginx, NAT, um Elastic IP e agente de failover."
+
+Parameters:
+  NetworkStackName:
+    Type: String
+    Default: studio-network
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: "^[a-zA-Z][-a-zA-Z0-9]*$"
+    Description: "Nome da stack criada com 01-network.yml."
+
+  ProjectName:
+    Type: String
+    Default: studio-essencia
+    MinLength: 3
+    MaxLength: 24
+    AllowedPattern: "^[a-z][a-z0-9-]*$"
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  KeyName:
+    Type: String
+    Default: ""
+    Description: "Opcional. Key Pair existente para SSH nos gateways."
+
+  GatewayInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: "Tipo das duas instancias gateway. t3.micro atende Nginx, NAT e o agente no laboratorio."
+
+  GatewayRootVolumeSize:
+    Type: Number
+    Default: 8
+    MinValue: 8
+    MaxValue: 100
+    Description: "Disco raiz de cada gateway, em GiB. O minimo de 8 reduz custo."
+
+  Gateway1PrivateIp:
+    Type: String
+    Default: 10.20.1.10
+    AllowedPattern: "^(([0-9]{1,3}\\.){3}[0-9]{1,3})$"
+    Description: "IP privado fixo do gateway ativo na sub-rede publica AZ-A."
+
+  Gateway2PrivateIp:
+    Type: String
+    Default: 10.20.2.10
+    AllowedPattern: "^(([0-9]{1,3}\\.){3}[0-9]{1,3})$"
+    Description: "IP privado fixo do gateway reserva na sub-rede publica AZ-B."
+
+  Manager1PrivateIp:
+    Type: String
+    Default: 10.20.11.10
+    AllowedPattern: "^(([0-9]{1,3}\\.){3}[0-9]{1,3})$"
+
+  Manager2PrivateIp:
+    Type: String
+    Default: 10.20.12.10
+    AllowedPattern: "^(([0-9]{1,3}\\.){3}[0-9]{1,3})$"
+
+  Manager3PrivateIp:
+    Type: String
+    Default: 10.20.13.10
+    AllowedPattern: "^(([0-9]{1,3}\\.){3}[0-9]{1,3})$"
+
+  CheckIntervalSeconds:
+    Type: Number
+    Default: 15
+    MinValue: 5
+    MaxValue: 120
+    Description: "Intervalo do health check do agente de failover."
+
+  FailureThreshold:
+    Type: Number
+    Default: 4
+    MinValue: 2
+    MaxValue: 20
+    Description: "Falhas consecutivas para promover o gateway reserva."
+
+  ArmedAfterChecks:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 20
+    Description: "Checks saudaveis necessarios para armar o failover apos o boot."
+
+  ImageId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
+
+Conditions:
+  HasKeyName: !Not
+    - !Equals
+      - !Ref KeyName
+      - ""
+
+Resources:
+  GatewayEip:
+    Type: "AWS::EC2::EIP"
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-gateway-eip"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ActiveGateway:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref GatewayInstanceType
+      KeyName: !If
+        - HasKeyName
+        - !Ref KeyName
+        - !Ref "AWS::NoValue"
+      IamInstanceProfile: LabInstanceProfile
+      SourceDestCheck: false
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          AssociatePublicIpAddress: true
+          SubnetId: !ImportValue
+            Fn::Sub: "${NetworkStackName}-PublicSubnet1Id"
+          PrivateIpAddress: !Ref Gateway1PrivateIp
+          GroupSet:
+            - !ImportValue
+              Fn::Sub: "${NetworkStackName}-GatewayManagementSecurityGroupId"
+            - !ImportValue
+              Fn::Sub: "${NetworkStackName}-GatewayNatSecurityGroupId"
+            - !ImportValue
+              Fn::Sub: "${NetworkStackName}-GatewayAppSecurityGroupId"
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref GatewayRootVolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData: 
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -euxo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+
+            apt_update() {
+              for attempt in $(seq 1 120); do
+                if apt-get update -y; then
+                  return 0
+                fi
+                echo "Aguardando NAT/apt ($attempt/120)..."
+                sleep 10
+              done
+              return 1
+            }
+
+            install_packages() {
+              for attempt in $(seq 1 30); do
+                if apt-get install -y "$@"; then
+                  return 0
+                fi
+                echo "Tentando instalar pacotes ($attempt/30)..."
+                sleep 10
+              done
+              return 1
+            }
+
+            apt_update
+            install_packages ca-certificates curl nginx iptables python3 python3-boto3
+
+            rm -f /etc/nginx/sites-enabled/default
+            cat >/etc/nginx/conf.d/studio.conf <<'NGINX'
+            map $http_upgrade $connection_upgrade {
+                default upgrade;
+                ''      close;
+            }
+
+            upstream studio_frontend {
+                server ${Manager1PrivateIp}:80 max_fails=3 fail_timeout=10s;
+                server ${Manager2PrivateIp}:80 max_fails=3 fail_timeout=10s;
+                server ${Manager3PrivateIp}:80 max_fails=3 fail_timeout=10s;
+            }
+
+            upstream studio_backend {
+                server ${Manager1PrivateIp}:8080 max_fails=3 fail_timeout=10s;
+                server ${Manager2PrivateIp}:8080 max_fails=3 fail_timeout=10s;
+                server ${Manager3PrivateIp}:8080 max_fails=3 fail_timeout=10s;
+            }
+
+            upstream studio_rabbitmq {
+                server ${Manager1PrivateIp}:15672 max_fails=3 fail_timeout=10s;
+                server ${Manager2PrivateIp}:15672 max_fails=3 fail_timeout=10s;
+                server ${Manager3PrivateIp}:15672 max_fails=3 fail_timeout=10s;
+            }
+
+            upstream studio_waha {
+                server ${Manager1PrivateIp}:3000 max_fails=3 fail_timeout=10s;
+                server ${Manager2PrivateIp}:3000 max_fails=3 fail_timeout=10s;
+                server ${Manager3PrivateIp}:3000 max_fails=3 fail_timeout=10s;
+            }
+
+            server {
+                listen 80 default_server;
+                server_name _;
+                client_max_body_size 64m;
+
+                location = /nginx-health {
+                    access_log off;
+                    add_header Content-Type text/plain;
+                    return 200 "ok\n";
+                }
+
+                location / {
+                    proxy_pass http://studio_frontend;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host $http_host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                    proxy_next_upstream error timeout http_502 http_503 http_504;
+                }
+            }
+
+            server {
+                listen 8080;
+                server_name _;
+                client_max_body_size 64m;
+
+                location / {
+                    proxy_pass http://studio_backend;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host $http_host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                    proxy_next_upstream error timeout http_502 http_503 http_504;
+                }
+            }
+
+            server {
+                listen 15672;
+                server_name _;
+
+                location / {
+                    proxy_pass http://studio_rabbitmq;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host $http_host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header Upgrade $http_upgrade;
+                    proxy_set_header Connection $connection_upgrade;
+                    proxy_read_timeout 3600s;
+                    proxy_next_upstream error timeout http_502 http_503 http_504;
+                }
+            }
+
+            server {
+                listen 3000;
+                server_name _;
+                client_max_body_size 64m;
+
+                location / {
+                    proxy_pass http://studio_waha;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host $http_host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header Upgrade $http_upgrade;
+                    proxy_set_header Connection $connection_upgrade;
+                    proxy_read_timeout 3600s;
+                    proxy_next_upstream error timeout http_502 http_503 http_504;
+                }
+            }
+            NGINX
+
+            nginx -t
+            systemctl enable nginx
+            systemctl restart nginx
+
+            cat >/etc/sysctl.d/99-studio-nat.conf <<'SYSCTL'
+            net.ipv4.ip_forward = 1
+            SYSCTL
+            sysctl --system
+
+            cat >/usr/local/sbin/studio-nat.sh <<'NAT'
+            #!/bin/bash
+            set -e
+            IFACE=$(ip route | awk '/^default/ {print $5; exit}')
+            if [ -z "$IFACE" ]; then
+              echo "Interface default nao encontrada"
+              exit 1
+            fi
+            iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
+            iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+            iptables -C FORWARD -i "$IFACE" -o "$IFACE" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$IFACE" -o "$IFACE" -j ACCEPT
+            NAT
+            chmod 0755 /usr/local/sbin/studio-nat.sh
+
+            cat >/etc/systemd/system/studio-nat.service <<'UNIT'
+            [Unit]
+            Description=Studio Essencia - NAT do gateway
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/sbin/studio-nat.sh
+            RemainAfterExit=yes
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+
+            systemctl daemon-reload
+            systemctl enable --now studio-nat.service
+
+            install -d -m 0700 /opt/studio-failover
+            cat >/opt/studio-failover/failover.py <<'PY'
+            #!/usr/bin/env python3
+            import logging
+            import os
+            import socket
+            import sys
+            import time
+            import urllib.request
+
+            import boto3
+            from botocore.exceptions import ClientError
+
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(asctime)s %(levelname)s %(message)s",
+            )
+
+            REGION = os.environ["AWS_REGION"]
+            PROJECT_NAME = os.environ["PROJECT_NAME"]
+            ENVIRONMENT = os.environ["ENVIRONMENT"]
+            EIP_ALLOCATION_ID = os.environ["EIP_ALLOCATION_ID"]
+            ACTIVE_PRIVATE_IP = os.environ["ACTIVE_PRIVATE_IP"]
+            APP_SG_ID = os.environ["APP_SG_ID"]
+            STANDBY_SG_IDS = [x for x in os.environ["STANDBY_SG_IDS"].split(",") if x]
+            ROUTE_TABLE_IDS = [x for x in os.environ["ROUTE_TABLE_IDS"].split(",") if x]
+            CHECK_INTERVAL = int(os.environ["CHECK_INTERVAL"])
+            FAILURE_THRESHOLD = int(os.environ["FAILURE_THRESHOLD"])
+            ARMED_AFTER = int(os.environ["ARMED_AFTER"])
+
+            ec2 = boto3.client("ec2", region_name=REGION)
+
+
+            def instance_id():
+                token_request = urllib.request.Request(
+                    "http://169.254.169.254/latest/api/token",
+                    method="PUT",
+                    headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+                )
+                with urllib.request.urlopen(token_request, timeout=5) as response:
+                    token = response.read().decode().strip()
+                request = urllib.request.Request(
+                    "http://169.254.169.254/latest/meta-data/instance-id",
+                    headers={"X-aws-ec2-metadata-token": token},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return response.read().decode().strip()
+
+
+            MY_INSTANCE_ID = instance_id()
+
+
+            def own_role():
+                response = ec2.describe_tags(
+                    Filters=[
+                        {"Name": "resource-id", "Values": [MY_INSTANCE_ID]},
+                        {"Name": "key", "Values": ["Role"]},
+                    ]
+                )
+                tags = response.get("Tags", [])
+                return tags[0]["Value"] if tags else None
+
+
+            def active_instance_id():
+                response = ec2.describe_instances(
+                    Filters=[
+                        {"Name": "tag:Role", "Values": ["gateway-active"]},
+                        {"Name": "tag:Project", "Values": [PROJECT_NAME]},
+                        {"Name": "tag:Environment", "Values": [ENVIRONMENT]},
+                        {"Name": "instance-state-name", "Values": ["running", "stopped"]},
+                    ]
+                )
+                for reservation in response.get("Reservations", []):
+                    for instance in reservation.get("Instances", []):
+                        return instance["InstanceId"]
+                return None
+
+
+            def active_instance_state():
+                active_id = active_instance_id()
+                if not active_id:
+                    return None
+                response = ec2.describe_instances(InstanceIds=[active_id])
+                for reservation in response.get("Reservations", []):
+                    for instance in reservation.get("Instances", []):
+                        return instance["State"]["Name"]
+                return None
+
+
+            def tcp_healthy(host, port=80):
+                try:
+                    with socket.create_connection((host, port), timeout=5):
+                        return True
+                except OSError:
+                    return False
+
+
+            def eip_state():
+                response = ec2.describe_addresses(AllocationIds=[EIP_ALLOCATION_ID])
+                addresses = response.get("Addresses", [])
+                if not addresses:
+                    raise RuntimeError("Elastic IP nao encontrado")
+                address = addresses[0]
+                return address.get("InstanceId"), address.get("AssociationId")
+
+
+            def set_groups(instance, groups):
+                ec2.modify_instance_attribute(InstanceId=instance, Groups=groups)
+
+
+            def update_routes():
+                for route_table_id in ROUTE_TABLE_IDS:
+                    try:
+                        ec2.replace_route(
+                            RouteTableId=route_table_id,
+                            DestinationCidrBlock="0.0.0.0/0",
+                            InstanceId=MY_INSTANCE_ID,
+                        )
+                    except ClientError as exc:
+                        code = exc.response.get("Error", {}).get("Code")
+                        if code == "InvalidRoute.NotFound":
+                            ec2.create_route(
+                                RouteTableId=route_table_id,
+                                DestinationCidrBlock="0.0.0.0/0",
+                                InstanceId=MY_INSTANCE_ID,
+                            )
+                        else:
+                            raise
+
+
+            def promote():
+                if not tcp_healthy("127.0.0.1"):
+                    raise RuntimeError("Nginx local nao esta saudavel")
+
+                active_id = active_instance_id()
+                current_instance, association_id = eip_state()
+                logging.info("Promovendo %s; EIP atual em %s", MY_INSTANCE_ID, current_instance)
+
+                if current_instance != MY_INSTANCE_ID:
+                    if association_id:
+                        try:
+                            ec2.disassociate_address(AssociationId=association_id)
+                        except ClientError as exc:
+                            logging.warning("Falha ao desassociar EIP: %s", exc)
+                    ec2.associate_address(
+                        AllocationId=EIP_ALLOCATION_ID,
+                        InstanceId=MY_INSTANCE_ID,
+                        AllowReassociation=True,
+                    )
+
+                set_groups(MY_INSTANCE_ID, STANDBY_SG_IDS + [APP_SG_ID])
+
+                if active_id and active_id != MY_INSTANCE_ID:
+                    try:
+                        set_groups(active_id, STANDBY_SG_IDS)
+                    except ClientError as exc:
+                        logging.warning("Nao foi possivel remover o SG publico do gateway antigo: %s", exc)
+
+                update_routes()
+                logging.info("Failover concluido; EIP e rotas apontam para %s", MY_INSTANCE_ID)
+
+
+            def main():
+                role = own_role()
+                if role == "gateway-active":
+                    logging.info("Esta instancia e o gateway ativo; agente nao atua")
+                    return
+                if role != "gateway-standby":
+                    raise RuntimeError("Tag Role=gateway-standby nao encontrada")
+
+                current_instance, _ = eip_state()
+                if current_instance == MY_INSTANCE_ID:
+                    logging.warning("EIP ja esta nesta instancia; reconciliando")
+                    promote()
+
+                armed = False
+                healthy_streak = 0
+                failure_streak = 0
+                active_eip_logged = False
+
+                while True:
+                    current_instance, _ = eip_state()
+                    if current_instance == MY_INSTANCE_ID:
+                        if not active_eip_logged:
+                            logging.info("EIP esta nesta instancia; aguardando failback")
+                            active_eip_logged = True
+                        failure_streak = 0
+                        time.sleep(CHECK_INTERVAL)
+                        continue
+                    active_eip_logged = False
+
+                    healthy = tcp_healthy(ACTIVE_PRIVATE_IP)
+                    if not armed:
+                        if healthy:
+                            healthy_streak += 1
+                            if healthy_streak >= ARMED_AFTER:
+                                armed = True
+                                logging.info("Failover armado apos %s checks saudaveis", healthy_streak)
+                        else:
+                            healthy_streak = 0
+                            state = active_instance_state()
+                            if state in ("stopped", "shutting-down", "terminated"):
+                                failure_streak += 1
+                                logging.warning(
+                                    "Gateway ativo em estado %s (%s/%s)",
+                                    state,
+                                    failure_streak,
+                                    FAILURE_THRESHOLD,
+                                )
+                                if failure_streak >= FAILURE_THRESHOLD:
+                                    promote()
+                                    armed = True
+                                    healthy_streak = 0
+                                    failure_streak = 0
+                            else:
+                                failure_streak = 0
+                    else:
+                        if healthy:
+                            failure_streak = 0
+                        else:
+                            failure_streak += 1
+                            logging.warning(
+                                "Gateway ativo indisponivel (%s/%s)",
+                                failure_streak,
+                                FAILURE_THRESHOLD,
+                            )
+                            if failure_streak >= FAILURE_THRESHOLD:
+                                promote()
+                                armed = True
+                                healthy_streak = 0
+                                failure_streak = 0
+                    time.sleep(CHECK_INTERVAL)
+
+
+            if __name__ == "__main__":
+                try:
+                    main()
+                except Exception:
+                    logging.exception("Falha no agente de failover")
+                    sys.exit(1)
+            PY
+            chmod 0700 /opt/studio-failover/failover.py
+
+            cat >/etc/studio-failover.env <<EOF
+            AWS_REGION=${Region}
+            PROJECT_NAME=${ProjectName}
+            ENVIRONMENT=${Environment}
+            EIP_ALLOCATION_ID=${EipAllocationId}
+            ACTIVE_PRIVATE_IP=${Gateway1PrivateIp}
+            APP_SG_ID=${GatewayAppSecurityGroupId}
+            STANDBY_SG_IDS=${GatewayManagementSecurityGroupId},${GatewayNatSecurityGroupId}
+            ROUTE_TABLE_IDS=${PrivateRouteTable1Id},${PrivateRouteTable2Id},${PrivateRouteTable3Id}
+            CHECK_INTERVAL=${CheckIntervalSeconds}
+            FAILURE_THRESHOLD=${FailureThreshold}
+            ARMED_AFTER=${ArmedAfterChecks}
+            EOF
+            chmod 0600 /etc/studio-failover.env
+
+            cat >/etc/systemd/system/studio-failover.service <<'UNIT'
+            [Unit]
+            Description=Studio Essencia - agente de failover do gateway reserva
+            After=network-online.target nginx.service studio-nat.service
+            Wants=network-online.target
+            Requires=nginx.service
+
+            [Service]
+            Type=simple
+            EnvironmentFile=/etc/studio-failover.env
+            ExecStart=/usr/bin/python3 /opt/studio-failover/failover.py
+            Restart=on-failure
+            RestartSec=30
+            User=root
+            NoNewPrivileges=true
+            PrivateTmp=true
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+
+            systemctl daemon-reload
+            systemctl enable --now studio-failover.service
+          - ProjectName: !Ref ProjectName
+            Environment: !Ref Environment
+            Manager1PrivateIp: !Ref Manager1PrivateIp
+            Manager2PrivateIp: !Ref Manager2PrivateIp
+            Manager3PrivateIp: !Ref Manager3PrivateIp
+            Gateway1PrivateIp: !Ref Gateway1PrivateIp
+            GatewayManagementSecurityGroupId: !ImportValue
+              Fn::Sub: "${NetworkStackName}-GatewayManagementSecurityGroupId"
+            GatewayNatSecurityGroupId: !ImportValue
+              Fn::Sub: "${NetworkStackName}-GatewayNatSecurityGroupId"
+            GatewayAppSecurityGroupId: !ImportValue
+              Fn::Sub: "${NetworkStackName}-GatewayAppSecurityGroupId"
+            EipAllocationId: !GetAtt GatewayEip.AllocationId
+            PrivateRouteTable1Id: !ImportValue
+              Fn::Sub: "${NetworkStackName}-PrivateRouteTable1Id"
+            PrivateRouteTable2Id: !ImportValue
+              Fn::Sub: "${NetworkStackName}-PrivateRouteTable2Id"
+            PrivateRouteTable3Id: !ImportValue
+              Fn::Sub: "${NetworkStackName}-PrivateRouteTable3Id"
+            CheckIntervalSeconds: !Ref CheckIntervalSeconds
+            FailureThreshold: !Ref FailureThreshold
+            ArmedAfterChecks: !Ref ArmedAfterChecks
+            Region: !Ref "AWS::Region"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-gateway-active"
+        - Key: Role
+          Value: gateway-active
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  StandbyGateway:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref GatewayInstanceType
+      KeyName: !If
+        - HasKeyName
+        - !Ref KeyName
+        - !Ref "AWS::NoValue"
+      IamInstanceProfile: LabInstanceProfile
+      SourceDestCheck: false
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          AssociatePublicIpAddress: true
+          SubnetId: !ImportValue
+            Fn::Sub: "${NetworkStackName}-PublicSubnet2Id"
+          PrivateIpAddress: !Ref Gateway2PrivateIp
+          GroupSet:
+            - !ImportValue
+              Fn::Sub: "${NetworkStackName}-GatewayManagementSecurityGroupId"
+            - !ImportValue
+              Fn::Sub: "${NetworkStackName}-GatewayNatSecurityGroupId"
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref GatewayRootVolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -euxo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+
+            apt_update() {
+              for attempt in $(seq 1 120); do
+                if apt-get update -y; then
+                  return 0
+                fi
+                echo "Aguardando NAT/apt ($attempt/120)..."
+                sleep 10
+              done
+              return 1
+            }
+
+            install_packages() {
+              for attempt in $(seq 1 30); do
+                if apt-get install -y "$@"; then
+                  return 0
+                fi
+                echo "Tentando instalar pacotes ($attempt/30)..."
+                sleep 10
+              done
+              return 1
+            }
+
+            apt_update
+            install_packages ca-certificates curl nginx iptables python3 python3-boto3
+
+            rm -f /etc/nginx/sites-enabled/default
+            cat >/etc/nginx/conf.d/studio.conf <<'NGINX'
+            map $http_upgrade $connection_upgrade {
+                default upgrade;
+                ''      close;
+            }
+
+            upstream studio_frontend {
+                server ${Manager1PrivateIp}:80 max_fails=3 fail_timeout=10s;
+                server ${Manager2PrivateIp}:80 max_fails=3 fail_timeout=10s;
+                server ${Manager3PrivateIp}:80 max_fails=3 fail_timeout=10s;
+            }
+
+            upstream studio_backend {
+                server ${Manager1PrivateIp}:8080 max_fails=3 fail_timeout=10s;
+                server ${Manager2PrivateIp}:8080 max_fails=3 fail_timeout=10s;
+                server ${Manager3PrivateIp}:8080 max_fails=3 fail_timeout=10s;
+            }
+
+            upstream studio_rabbitmq {
+                server ${Manager1PrivateIp}:15672 max_fails=3 fail_timeout=10s;
+                server ${Manager2PrivateIp}:15672 max_fails=3 fail_timeout=10s;
+                server ${Manager3PrivateIp}:15672 max_fails=3 fail_timeout=10s;
+            }
+
+            upstream studio_waha {
+                server ${Manager1PrivateIp}:3000 max_fails=3 fail_timeout=10s;
+                server ${Manager2PrivateIp}:3000 max_fails=3 fail_timeout=10s;
+                server ${Manager3PrivateIp}:3000 max_fails=3 fail_timeout=10s;
+            }
+
+            server {
+                listen 80 default_server;
+                server_name _;
+                client_max_body_size 64m;
+
+                location = /nginx-health {
+                    access_log off;
+                    add_header Content-Type text/plain;
+                    return 200 "ok\n";
+                }
+
+                location / {
+                    proxy_pass http://studio_frontend;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host $http_host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                    proxy_next_upstream error timeout http_502 http_503 http_504;
+                }
+            }
+
+            server {
+                listen 8080;
+                server_name _;
+                client_max_body_size 64m;
+
+                location / {
+                    proxy_pass http://studio_backend;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host $http_host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                    proxy_next_upstream error timeout http_502 http_503 http_504;
+                }
+            }
+
+            server {
+                listen 15672;
+                server_name _;
+
+                location / {
+                    proxy_pass http://studio_rabbitmq;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host $http_host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header Upgrade $http_upgrade;
+                    proxy_set_header Connection $connection_upgrade;
+                    proxy_read_timeout 3600s;
+                    proxy_next_upstream error timeout http_502 http_503 http_504;
+                }
+            }
+
+            server {
+                listen 3000;
+                server_name _;
+                client_max_body_size 64m;
+
+                location / {
+                    proxy_pass http://studio_waha;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host $http_host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header Upgrade $http_upgrade;
+                    proxy_set_header Connection $connection_upgrade;
+                    proxy_read_timeout 3600s;
+                    proxy_next_upstream error timeout http_502 http_503 http_504;
+                }
+            }
+            NGINX
+
+            nginx -t
+            systemctl enable nginx
+            systemctl restart nginx
+
+            cat >/etc/sysctl.d/99-studio-nat.conf <<'SYSCTL'
+            net.ipv4.ip_forward = 1
+            SYSCTL
+            sysctl --system
+
+            cat >/usr/local/sbin/studio-nat.sh <<'NAT'
+            #!/bin/bash
+            set -e
+            IFACE=$(ip route | awk '/^default/ {print $5; exit}')
+            if [ -z "$IFACE" ]; then
+              echo "Interface default nao encontrada"
+              exit 1
+            fi
+            iptables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
+            iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+            iptables -C FORWARD -i "$IFACE" -o "$IFACE" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$IFACE" -o "$IFACE" -j ACCEPT
+            NAT
+            chmod 0755 /usr/local/sbin/studio-nat.sh
+
+            cat >/etc/systemd/system/studio-nat.service <<'UNIT'
+            [Unit]
+            Description=Studio Essencia - NAT do gateway
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/sbin/studio-nat.sh
+            RemainAfterExit=yes
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+
+            systemctl daemon-reload
+            systemctl enable --now studio-nat.service
+
+            install -d -m 0700 /opt/studio-failover
+            cat >/opt/studio-failover/failover.py <<'PY'
+            #!/usr/bin/env python3
+            import logging
+            import os
+            import socket
+            import sys
+            import time
+            import urllib.request
+
+            import boto3
+            from botocore.exceptions import ClientError
+
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(asctime)s %(levelname)s %(message)s",
+            )
+
+            REGION = os.environ["AWS_REGION"]
+            PROJECT_NAME = os.environ["PROJECT_NAME"]
+            ENVIRONMENT = os.environ["ENVIRONMENT"]
+            EIP_ALLOCATION_ID = os.environ["EIP_ALLOCATION_ID"]
+            ACTIVE_PRIVATE_IP = os.environ["ACTIVE_PRIVATE_IP"]
+            APP_SG_ID = os.environ["APP_SG_ID"]
+            STANDBY_SG_IDS = [x for x in os.environ["STANDBY_SG_IDS"].split(",") if x]
+            ROUTE_TABLE_IDS = [x for x in os.environ["ROUTE_TABLE_IDS"].split(",") if x]
+            CHECK_INTERVAL = int(os.environ["CHECK_INTERVAL"])
+            FAILURE_THRESHOLD = int(os.environ["FAILURE_THRESHOLD"])
+            ARMED_AFTER = int(os.environ["ARMED_AFTER"])
+
+            ec2 = boto3.client("ec2", region_name=REGION)
+
+
+            def instance_id():
+                token_request = urllib.request.Request(
+                    "http://169.254.169.254/latest/api/token",
+                    method="PUT",
+                    headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+                )
+                with urllib.request.urlopen(token_request, timeout=5) as response:
+                    token = response.read().decode().strip()
+                request = urllib.request.Request(
+                    "http://169.254.169.254/latest/meta-data/instance-id",
+                    headers={"X-aws-ec2-metadata-token": token},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return response.read().decode().strip()
+
+
+            MY_INSTANCE_ID = instance_id()
+
+
+            def own_role():
+                response = ec2.describe_tags(
+                    Filters=[
+                        {"Name": "resource-id", "Values": [MY_INSTANCE_ID]},
+                        {"Name": "key", "Values": ["Role"]},
+                    ]
+                )
+                tags = response.get("Tags", [])
+                return tags[0]["Value"] if tags else None
+
+
+            def active_instance_id():
+                response = ec2.describe_instances(
+                    Filters=[
+                        {"Name": "tag:Role", "Values": ["gateway-active"]},
+                        {"Name": "tag:Project", "Values": [PROJECT_NAME]},
+                        {"Name": "tag:Environment", "Values": [ENVIRONMENT]},
+                        {"Name": "instance-state-name", "Values": ["running", "stopped"]},
+                    ]
+                )
+                for reservation in response.get("Reservations", []):
+                    for instance in reservation.get("Instances", []):
+                        return instance["InstanceId"]
+                return None
+
+
+            def active_instance_state():
+                active_id = active_instance_id()
+                if not active_id:
+                    return None
+                response = ec2.describe_instances(InstanceIds=[active_id])
+                for reservation in response.get("Reservations", []):
+                    for instance in reservation.get("Instances", []):
+                        return instance["State"]["Name"]
+                return None
+
+
+            def tcp_healthy(host, port=80):
+                try:
+                    with socket.create_connection((host, port), timeout=5):
+                        return True
+                except OSError:
+                    return False
+
+
+            def eip_state():
+                response = ec2.describe_addresses(AllocationIds=[EIP_ALLOCATION_ID])
+                addresses = response.get("Addresses", [])
+                if not addresses:
+                    raise RuntimeError("Elastic IP nao encontrado")
+                address = addresses[0]
+                return address.get("InstanceId"), address.get("AssociationId")
+
+
+            def set_groups(instance, groups):
+                ec2.modify_instance_attribute(InstanceId=instance, Groups=groups)
+
+
+            def update_routes():
+                for route_table_id in ROUTE_TABLE_IDS:
+                    try:
+                        ec2.replace_route(
+                            RouteTableId=route_table_id,
+                            DestinationCidrBlock="0.0.0.0/0",
+                            InstanceId=MY_INSTANCE_ID,
+                        )
+                    except ClientError as exc:
+                        code = exc.response.get("Error", {}).get("Code")
+                        if code == "InvalidRoute.NotFound":
+                            ec2.create_route(
+                                RouteTableId=route_table_id,
+                                DestinationCidrBlock="0.0.0.0/0",
+                                InstanceId=MY_INSTANCE_ID,
+                            )
+                        else:
+                            raise
+
+
+            def promote():
+                if not tcp_healthy("127.0.0.1"):
+                    raise RuntimeError("Nginx local nao esta saudavel")
+
+                active_id = active_instance_id()
+                current_instance, association_id = eip_state()
+                logging.info("Promovendo %s; EIP atual em %s", MY_INSTANCE_ID, current_instance)
+
+                if current_instance != MY_INSTANCE_ID:
+                    if association_id:
+                        try:
+                            ec2.disassociate_address(AssociationId=association_id)
+                        except ClientError as exc:
+                            logging.warning("Falha ao desassociar EIP: %s", exc)
+                    ec2.associate_address(
+                        AllocationId=EIP_ALLOCATION_ID,
+                        InstanceId=MY_INSTANCE_ID,
+                        AllowReassociation=True,
+                    )
+
+                set_groups(MY_INSTANCE_ID, STANDBY_SG_IDS + [APP_SG_ID])
+
+                if active_id and active_id != MY_INSTANCE_ID:
+                    try:
+                        set_groups(active_id, STANDBY_SG_IDS)
+                    except ClientError as exc:
+                        logging.warning("Nao foi possivel remover o SG publico do gateway antigo: %s", exc)
+
+                update_routes()
+                logging.info("Failover concluido; EIP e rotas apontam para %s", MY_INSTANCE_ID)
+
+
+            def main():
+                role = own_role()
+                if role == "gateway-active":
+                    logging.info("Esta instancia e o gateway ativo; agente nao atua")
+                    return
+                if role != "gateway-standby":
+                    raise RuntimeError("Tag Role=gateway-standby nao encontrada")
+
+                current_instance, _ = eip_state()
+                if current_instance == MY_INSTANCE_ID:
+                    logging.warning("EIP ja esta nesta instancia; reconciliando")
+                    promote()
+
+                armed = False
+                healthy_streak = 0
+                failure_streak = 0
+                active_eip_logged = False
+
+                while True:
+                    current_instance, _ = eip_state()
+                    if current_instance == MY_INSTANCE_ID:
+                        if not active_eip_logged:
+                            logging.info("EIP esta nesta instancia; aguardando failback")
+                            active_eip_logged = True
+                        failure_streak = 0
+                        time.sleep(CHECK_INTERVAL)
+                        continue
+                    active_eip_logged = False
+
+                    healthy = tcp_healthy(ACTIVE_PRIVATE_IP)
+                    if not armed:
+                        if healthy:
+                            healthy_streak += 1
+                            if healthy_streak >= ARMED_AFTER:
+                                armed = True
+                                logging.info("Failover armado apos %s checks saudaveis", healthy_streak)
+                        else:
+                            healthy_streak = 0
+                            state = active_instance_state()
+                            if state in ("stopped", "shutting-down", "terminated"):
+                                failure_streak += 1
+                                logging.warning(
+                                    "Gateway ativo em estado %s (%s/%s)",
+                                    state,
+                                    failure_streak,
+                                    FAILURE_THRESHOLD,
+                                )
+                                if failure_streak >= FAILURE_THRESHOLD:
+                                    promote()
+                                    armed = True
+                                    healthy_streak = 0
+                                    failure_streak = 0
+                            else:
+                                failure_streak = 0
+                    else:
+                        if healthy:
+                            failure_streak = 0
+                        else:
+                            failure_streak += 1
+                            logging.warning(
+                                "Gateway ativo indisponivel (%s/%s)",
+                                failure_streak,
+                                FAILURE_THRESHOLD,
+                            )
+                            if failure_streak >= FAILURE_THRESHOLD:
+                                promote()
+                                armed = True
+                                healthy_streak = 0
+                                failure_streak = 0
+                    time.sleep(CHECK_INTERVAL)
+
+
+            if __name__ == "__main__":
+                try:
+                    main()
+                except Exception:
+                    logging.exception("Falha no agente de failover")
+                    sys.exit(1)
+            PY
+            chmod 0700 /opt/studio-failover/failover.py
+
+            cat >/etc/studio-failover.env <<EOF
+            AWS_REGION=${Region}
+            PROJECT_NAME=${ProjectName}
+            ENVIRONMENT=${Environment}
+            EIP_ALLOCATION_ID=${EipAllocationId}
+            ACTIVE_PRIVATE_IP=${Gateway1PrivateIp}
+            APP_SG_ID=${GatewayAppSecurityGroupId}
+            STANDBY_SG_IDS=${GatewayManagementSecurityGroupId},${GatewayNatSecurityGroupId}
+            ROUTE_TABLE_IDS=${PrivateRouteTable1Id},${PrivateRouteTable2Id},${PrivateRouteTable3Id}
+            CHECK_INTERVAL=${CheckIntervalSeconds}
+            FAILURE_THRESHOLD=${FailureThreshold}
+            ARMED_AFTER=${ArmedAfterChecks}
+            EOF
+            chmod 0600 /etc/studio-failover.env
+
+            cat >/etc/systemd/system/studio-failover.service <<'UNIT'
+            [Unit]
+            Description=Studio Essencia - agente de failover do gateway reserva
+            After=network-online.target nginx.service studio-nat.service
+            Wants=network-online.target
+            Requires=nginx.service
+
+            [Service]
+            Type=simple
+            EnvironmentFile=/etc/studio-failover.env
+            ExecStart=/usr/bin/python3 /opt/studio-failover/failover.py
+            Restart=on-failure
+            RestartSec=30
+            User=root
+            NoNewPrivileges=true
+            PrivateTmp=true
+
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+
+            systemctl daemon-reload
+            systemctl enable --now studio-failover.service
+          - ProjectName: !Ref ProjectName
+            Environment: !Ref Environment
+            Manager1PrivateIp: !Ref Manager1PrivateIp
+            Manager2PrivateIp: !Ref Manager2PrivateIp
+            Manager3PrivateIp: !Ref Manager3PrivateIp
+            Gateway1PrivateIp: !Ref Gateway1PrivateIp
+            GatewayManagementSecurityGroupId: !ImportValue
+              Fn::Sub: "${NetworkStackName}-GatewayManagementSecurityGroupId"
+            GatewayNatSecurityGroupId: !ImportValue
+              Fn::Sub: "${NetworkStackName}-GatewayNatSecurityGroupId"
+            GatewayAppSecurityGroupId: !ImportValue
+              Fn::Sub: "${NetworkStackName}-GatewayAppSecurityGroupId"
+            EipAllocationId: !GetAtt GatewayEip.AllocationId
+            PrivateRouteTable1Id: !ImportValue
+              Fn::Sub: "${NetworkStackName}-PrivateRouteTable1Id"
+            PrivateRouteTable2Id: !ImportValue
+              Fn::Sub: "${NetworkStackName}-PrivateRouteTable2Id"
+            PrivateRouteTable3Id: !ImportValue
+              Fn::Sub: "${NetworkStackName}-PrivateRouteTable3Id"
+            CheckIntervalSeconds: !Ref CheckIntervalSeconds
+            FailureThreshold: !Ref FailureThreshold
+            ArmedAfterChecks: !Ref ArmedAfterChecks
+            Region: !Ref "AWS::Region"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-gateway-standby"
+        - Key: Role
+          Value: gateway-standby
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  GatewayEipAssociation:
+    Type: "AWS::EC2::EIPAssociation"
+    Properties:
+      EIP: !Ref GatewayEip
+      InstanceId: !Ref ActiveGateway
+
+  PrivateDefaultRoute1:
+    Type: "AWS::EC2::Route"
+    Properties:
+      RouteTableId: !ImportValue
+        Fn::Sub: "${NetworkStackName}-PrivateRouteTable1Id"
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId: !Ref ActiveGateway
+
+  PrivateDefaultRoute2:
+    Type: "AWS::EC2::Route"
+    Properties:
+      RouteTableId: !ImportValue
+        Fn::Sub: "${NetworkStackName}-PrivateRouteTable2Id"
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId: !Ref ActiveGateway
+
+  PrivateDefaultRoute3:
+    Type: "AWS::EC2::Route"
+    Properties:
+      RouteTableId: !ImportValue
+        Fn::Sub: "${NetworkStackName}-PrivateRouteTable3Id"
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId: !Ref ActiveGateway
+
+Outputs:
+  PublicIp:
+    Description: "Unico Elastic IP publico do ambiente"
+    Value: !Ref GatewayEip
+    Export:
+      Name: !Sub "${AWS::StackName}-PublicIp"
+
+  FrontendUrl:
+    Description: "URL publica do frontend"
+    Value: !Sub "http://${GatewayEip}/"
+
+  BackendUrl:
+    Description: "URL publica do backend"
+    Value: !Sub "http://${GatewayEip}:8080"
+
+  RabbitMqManagementUrl:
+    Description: "Painel do RabbitMQ"
+    Value: !Sub "http://${GatewayEip}:15672"
+
+  WahaUrl:
+    Description: "Painel do WAHA"
+    Value: !Sub "http://${GatewayEip}:3000"
+
+  NginxHealthUrl:
+    Description: "Health check do Nginx ativo"
+    Value: !Sub "http://${GatewayEip}/nginx-health"
+
+  EipAllocationId:
+    Description: "Allocation ID do Elastic IP"
+    Value: !GetAtt GatewayEip.AllocationId
+
+  ActiveGatewayInstanceId:
+    Description: "Instancia originalmente ativa"
+    Value: !Ref ActiveGateway
+
+  StandbyGatewayInstanceId:
+    Description: "Instancia originalmente reserva"
+    Value: !Ref StandbyGateway
+
+  ActiveGatewayPrivateIp:
+    Description: "IP privado do gateway ativo"
+    Value: !Ref Gateway1PrivateIp
+
+  StandbyGatewayPrivateIp:
+    Description: "IP privado do gateway reserva"
+    Value: !Ref Gateway2PrivateIp
+
+  SshBastionHost:
+    Description: "Host publico para SSH/ProxyJump"
+    Value: !Ref GatewayEip

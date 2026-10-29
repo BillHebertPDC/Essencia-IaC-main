@@ -1,0 +1,229 @@
+# Deploy alvo com placement por labels.
+# Os labels sao aplicados automaticamente pelo servico swarm-labeler dos
+# managers, com base no hostname de cada no. Nao e necessario rotular manualmente.
+#
+# Nos de aplicacao: role=app
+# MySQL:            role=database
+# RabbitMQ:         role=rabbitmq
+# Managers:         role=manager (nao recebem tarefas de aplicacao)
+#
+# MySQL e RabbitMQ usam bind mounts em /data, montado a partir do EBS dedicado
+# criado pela stack 03-cluster.yml.
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: admin
+      MYSQL_DATABASE: studioessencia
+      MYSQL_USER: admin
+      MYSQL_PASSWORD: admin
+      TZ: America/Sao_Paulo
+    volumes:
+      - /data/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -padmin --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      studio-network:
+        aliases:
+          - mysql
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+          - node.labels.role == database
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          memory: 1024M
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+      TZ: America/Sao_Paulo
+    ports:
+      - target: 15672
+        published: 15672
+        protocol: tcp
+        mode: ingress
+    volumes:
+      - /data/rabbitmq:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      studio-network:
+        aliases:
+          - rabbitmq
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+          - node.labels.role == rabbitmq
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          memory: 512M
+
+  waha:
+    image: devlikeapro/waha:latest
+    environment:
+      WAHA_API_KEY: ""
+      WAHA_NO_API_KEY: "True"
+      WHATSAPP_API_KEY: ""
+      WHATSAPP_API_KEY_EXCLUDE_PATH: "health,ping"
+      WAHA_DASHBOARD_USERNAME: admin
+      WAHA_DASHBOARD_PASSWORD: ""
+      WAHA_DASHBOARD_NO_PASSWORD: "True"
+      WHATSAPP_SWAGGER_PASSWORD: ""
+      WHATSAPP_SWAGGER_NO_PASSWORD: "True"
+      WAHA_PRINT_QR: "true"
+      WHATSAPP_DEFAULT_ENGINE: NOWEB
+      WHATSAPP_START_SESSION: "default"
+      WHATSAPP_RESTART_ALL_SESSIONS: "True"
+      TZ: America/Sao_Paulo
+    ports:
+      - target: 3000
+        published: 3000
+        protocol: tcp
+        mode: ingress
+    volumes:
+      - waha_instances:/app/.sessions
+    networks:
+      studio-network:
+        aliases:
+          - waha
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+          - node.labels.role == app
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          memory: 512M
+
+  studio-essencia-backend:
+    image: "billhebertpdc/studio-essencia-backend:latest"
+    environment:
+      SPRING_DATASOURCE_URL: "jdbc:mysql://mysql:3306/studioessencia?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=America/Sao_Paulo"
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: com.mysql.cj.jdbc.Driver
+      SPRING_DATASOURCE_USERNAME: admin
+      SPRING_DATASOURCE_PASSWORD: admin
+      SPRING_JPA_DDL_AUTO: "none"
+      SPRING_SQL_INIT_MODE: "always"
+      SPRING_SQL_INIT_DATA_LOCATIONS: "classpath:db/init.sql"
+      JWT_SECRET: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+      JWT_VALIDITY: "3600"
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USERNAME: admin
+      RABBITMQ_PASSWORD: admin
+      CORS_ALLOWEDORIGINS: "${CORS_ALLOWED_ORIGINS:-http://localhost:5173}"
+      TZ: "America/Sao_Paulo"
+      JAVA_TOOL_OPTIONS: "-Duser.timezone=America/Sao_Paulo -XX:MaxRAMPercentage=60 -XX:MaxRAM=512m"
+    ports:
+      - target: 8080
+        published: 8080
+        protocol: tcp
+        mode: ingress
+    volumes:
+      - backend_uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/swagger-ui.html"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    networks:
+      studio-network:
+        aliases:
+          - studio-essencia-backend
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+          - node.labels.role == app
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          memory: 1536M
+
+  studio-essencia-actions-service:
+    image: "billhebertpdc/studio-essencia-actions-service:latest"
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USERNAME: admin
+      RABBITMQ_PASSWORD: admin
+      WAHA_API_URL: "http://waha:3000"
+      WAHA_API_KEY: admin
+      WAHA_SESSION: default
+      WHATSAPP_PROVIDER: "waha"
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=60 -XX:MaxRAM=300m"
+    networks:
+      studio-network:
+        aliases:
+          - studio-essencia-actions-service
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+          - node.labels.role == app
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          memory: 400M
+
+  studio-essencia-front:
+    image: "billhebertpdc/studio-essencia-front:latest"
+    environment:
+      API_BASE_URL: "${API_BASE_URL:-http://localhost:8080}"
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: ingress
+    networks:
+      studio-network:
+        aliases:
+          - studio-essencia-front
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+          - node.labels.role == app
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  waha_instances:
+  backend_uploads:
+
+networks:
+  studio-network:
+    driver: overlay
+    attachable: true
