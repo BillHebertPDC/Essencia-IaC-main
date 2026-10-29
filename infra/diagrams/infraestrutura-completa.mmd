@@ -1,76 +1,102 @@
 %% Studio Essencia - visao completa da infraestrutura (AWS us-west-2)
-%% Fontes: 01-network.yml, 02-gateway.yml, 03-cluster.yml, swarm/studio-essencia-stack-placement.yml
+%% Fontes: 01-network.yml, 02-gateway.yml, 03-cluster.yml, swarm/app-bootstrap/deploy-app.sh
+%% Renderizar: GitHub (arquivo .mmd), VS Code com extensao Mermaid, mermaid.live ou `mmdc`.
 
 flowchart TB
 
-    BRW["Navegador / usuario final<br/>chama http://EIP/ (site) e http://EIP:8080 (API)<br/>liberado para AllowedWebCidr (default 0.0.0.0/0)"]
-    ADM["Estacao do administrador<br/>SSH 22, RabbitMQ UI 15672, WAHA 3000<br/>liberado apenas para AllowedAdminCidr /32"]
-    EIP["Elastic IP unico (EIP)<br/>criado e exportado pela stack studio-gateway<br/>movido no failover"]
-    WA["WhatsApp (cloud API externa)"]
-    SSMN["AWS Systems Manager<br/>Session Manager / Run Command<br/>via LabInstanceProfile (todos os nos)"]
-    S3["S3: bucket-studio-teste-essencia-comprovante<br/>us-east-1 - fotos/comprovantes<br/>(criado fora deste IaC)"]
+    BRW["Navegador do usuario<br/>site http://EIP/ e API http://EIP:8080<br/>portas 80/8080 abertas a AllowedWebCidr (default 0.0.0.0/0)"]
+    ADM["Estacao do administrador<br/>SSH 22, RabbitMQ UI 15672, WAHA 3000<br/>apenas AllowedAdminCidr /32"]
+    EIP["Elastic IP unico<br/>criado e exportado (PublicIp) pela stack dos gateways<br/>movido pelo agente no failover"]
+    WAP["WhatsApp (cloud API externa)"]
+    NET["Internet<br/>Docker Hub, apt/get.docker.com, S3, WhatsApp<br/>acessados pelo cluster via NAT do gateway"]
+    SSMN["AWS Systems Manager<br/>Session Manager / Run Command<br/>perfil LabInstanceProfile - fornecido pelo laboratorio,<br/>nao criado por estes templates"]
+    S3["S3: bucket-studio-teste-essencia-comprovante<br/>us-east-1 - fotos/comprovantes<br/>externo ao IaC (nao criado pelas stacks)"]
 
-    subgraph VPC["VPC studio-essencia-dev-vpc - 10.20.0.0/16 - stack studio-network"]
+    subgraph VPC["VPC studio-essencia-dev 10.20.0.0/16 - stack studio-network"]
 
-        IGW["Internet Gateway (igw)"]
-        PRT["RT publica: 0.0.0.0/0 -> IGW<br/>associada as 2 sub-redes publicas"]
-        PRTS["RTs privadas A/B/C (1 por AZ)<br/>0.0.0.0/0 -> ENI do gateway ATIVO<br/>reescritas pelo agente no failover"]
-        SGDEF["SECURITY GROUPS<br/>gateway-mgmt-sg: 22 <- AdminCidr<br/>gateway-app-sg: 80,443,8080 <- WebCidr | 15672,3000 <- AdminCidr<br/>gateway-nat-sg: tudo <- cluster-sg<br/>cluster-sg: 22 <- gateway-mgmt | 80,8080,15672,3000 <- gateway-app | trafego total entre si (Swarm 2377/7946/4780, token 8081, dados)<br/>database-sg: 3306 <- cluster-sg<br/>rabbitmq-sg: 5672 e 15672 <- cluster-sg"]
+        SGL["SECURITY GROUPS (anexados as interfaces dos nos)<br/>gateway-mgmt-sg: TCP 22 <- AdminCidr<br/>gateway-app-sg: 80,443,8080 <- WebCidr | 15672,3000 <- AdminCidr | 80 <- gateway-mgmt (health do agente) | ICMP. OBS: 443 liberado, mas o Nginx ainda nao tem listener TLS<br/>gateway-nat-sg: qualquer protocolo <- cluster-sg (trajego do NAT)<br/>cluster-sg: 22 <- gateway-mgmt | 80,8080,15672,3000 <- gateway-app | total <- proprio cluster (Swarm: 2377 TCP quorum, 7946 TCP/UDP gossip, 4789 UDP overlay VXLAN, 8081 token, portas dos servicos)<br/>database-sg: 3306 <- cluster-sg<br/>rabbitmq-sg: 5672 e 15672 <- cluster-sg"]
+        IGW["Internet Gateway"]
+        RTPUB["RT publica<br/>0.0.0.0/0 -> IGW"]
+        NOTE9["Total em execucao: 9 EC2<br/>2 gateways + 3 managers + 2 workers + 2 nos de dados<br/>= limite de 9 instancias running do AWS Academy"]
 
-        subgraph AZA["Availability Zone A"]
+        subgraph AZA["AZ-A"]
             subgraph SPA["subnet publica 10.20.1.0/24"]
-                GWA["EC2 t3.micro root 8GiB - GATEWAY ATIVO 10.20.1.10<br/>Ubuntu 24.04 | NGINX + NAT (iptables MASQUERADE)<br/>Nginx: 80/8080/15672/3000 -> managers (Host com porta)<br/>SGs: gateway-mgmt + gateway-nat + gateway-app (publico)<br/>recebe o EIP"]
+                GWA["GATEWAY ATIVO - EC2 t3.micro, root 8GiB<br/>10.20.1.10 - Ubuntu 24.04<br/>NGINX: proxy 80/8080/15672/3000 -> managers<br/>envia Host com porta (http_host; corrige CORS)<br/>NAT: sysctl ip_forward + iptables MASQUERADE<br/>SGs: gateway-mgmt + gateway-nat + gateway-app"]
             end
             subgraph SPI["subnet privada 10.20.11.0/24"]
-                M1["EC2 t3.micro root 20GiB - MANAGER-1 10.20.11.10<br/>Docker Swarm manager (leader inicial)<br/>ingress routing mesh + token join HTTP :8081<br/>SG cluster-sg"]
-                DBN["EC2 t3.small root 20GiB - MYSQL 10.20.11.20<br/>worker Swarm label role=database<br/>container mysql:8.4 - 3306 so na overlay<br/>EBS gp3 8GiB DeletionPolicy Retain em /data/mysql<br/>SGs cluster-sg + database-sg"]
+                RTA["RT privada-A<br/>0.0.0.0/0 -> ENI do gateway ativo"]
+                M1["MANAGER-1 - EC2 t3.micro, root 20GiB<br/>10.20.11.10 - Docker Swarm manager (leader inicial)<br/>ingress routing mesh + token de join HTTP :8081<br/>servico systemd swarm-labeler (labels por hostname)<br/>SG: cluster-sg"]
+                DBN["MYSQL - EC2 t3.small, root 20GiB<br/>10.20.11.20 - worker Swarm, label role=database<br/>container mysql:8.4 - porta 3306 so na overlay<br/>SGs: cluster-sg + database-sg"]
+                EBSA[("EBS gp3 8GiB, DeletionPolicy Retain<br/>ext4 LABEL=studio-data em /data/mysql<br/>bind mount do container")]
+                DBN --- EBSA
             end
         end
 
-        subgraph AZB["Availability Zone B"]
+        subgraph AZB["AZ-B"]
             subgraph SPB["subnet publica 10.20.2.0/24"]
-                GWS["EC2 t3.micro root 8GiB - GATEWAY RESERVA 10.20.2.10<br/>Ubuntu 24.04 | NGINX + NAT iguais ao ativo<br/>agente de failover: TCP 80 a cada 15s, 4 falhas=1min<br/>promove: move EIP + gateway-app SG + rotas privadas<br/>SGs gateway-mgmt + gateway-nat (sem app ate promover)"]
+                GWS["GATEWAY RESERVA - EC2 t3.micro, root 8GiB<br/>10.20.2.10 - NGINX + NAT identicos ao ativo<br/>agente de failover (systemd): TCP 80 a cada 15s,<br/>4 falhas (~1min) move EIP + gateway-app SG + rotas<br/>failback manual (scripts/switch-gateway.ps1)<br/>SGs: gateway-mgmt + gateway-nat (sem app ate promover)"]
             end
             subgraph SP2["subnet privada 10.20.12.0/24"]
-                M2["EC2 t3.micro - MANAGER-2 10.20.12.10<br/>Swarm manager + ingress mesh<br/>SG cluster-sg"]
-                RBN["EC2 t3.small - RABBITMQ 10.20.12.20<br/>worker Swarm label role=rabbitmq<br/>container rabbitmq:4-management<br/>5672 AMQP interno | 15672 UI na overlay<br/>EBS gp3 8GiB Retain em /data/rabbitmq<br/>SGs cluster-sg + rabbitmq-sg"]
+                RTB["RT privada-B<br/>0.0.0.0/0 -> ENI do gateway ativo"]
+                M2["MANAGER-2 - EC2 t3.micro, root 20GiB<br/>10.20.12.10 - manager Swarm + ingress mesh<br/>SG: cluster-sg"]
+                RBN["RABBITMQ - EC2 t3.small, root 20GiB<br/>10.20.12.20 - worker Swarm, label role=rabbitmq<br/>container rabbitmq:4-management<br/>AMQP 5672 interno | UI 15672 publicada no Swarm<br/>SGs: cluster-sg + rabbitmq-sg"]
+                EBSB[("EBS gp3 8GiB, DeletionPolicy Retain<br/>ext4 LABEL=studio-data em /data/rabbitmq<br/>bind mount do container")]
+                RBN --- EBSB
             end
         end
 
-        subgraph AZC["Availability Zone C"]
+        subgraph AZC["AZ-C"]
             subgraph SP3["subnet privada 10.20.13.0/24"]
-                M3["EC2 t3.micro - MANAGER-3 10.20.13.10<br/>Swarm manager (quorum 2/3 sobrevive a 1 AZ)<br/>SG cluster-sg"]
+                RTC["RT privada-C<br/>0.0.0.0/0 -> ENI do gateway ativo"]
+                M3["MANAGER-3 - EC2 t3.micro, root 20GiB<br/>10.20.13.10 - manager Swarm<br/>quorum 2/3 sobrevive a queda de 1 AZ<br/>SG: cluster-sg"]
             end
         end
 
-        WKS["Auto Scaling Group app-workers - 2x t3.small root 20GiB<br/>espalhados pelas 3 sub-redes privadas, sem IP publico<br/>worker Swarm label role=app | SG cluster-sg<br/>containers: studio-essencia-front (REACT servido por nginx, :80)<br/>studio-essencia-backend (SPRING BOOT API/JWT, :8080)<br/>studio-essencia-actions-service (SPRING BOOT consumer fila, sem porta)<br/>waha (devlikeapro/waha API WhatsApp, :3000)<br/>volumes docker: backend_uploads, waha_instances"]
-        OVL["Rede overlay do Swarm: studio-network<br/>aliases DNS: mysql, rabbitmq, waha, studio-essencia-backend, front"]
-
-        SGDEF -.- VPCNOTE[" "]
-        M1 --- OVL
-        M2 --- OVL
-        M3 --- OVL
-        WKS --- OVL
-        DBN --- OVL
-        RBN --- OVL
+        subgraph WK["Auto Scaling Group app-workers - RTs privadas A/B/C"]
+            W1["app-worker-1 - EC2 t3.small, root 20GiB<br/>sem IP publico - saida pelo NAT<br/>worker Swarm, label role=app | SG cluster-sg"]
+            W2["app-worker-2 - EC2 t3.small, root 20GiB<br/>sem IP publico - saida pelo NAT<br/>worker Swarm, label role=app | SG cluster-sg"]
+            FRONT["studio-essencia-front<br/>REACT (build servido por Nginx no container)<br/>publicado :80 no Swarm ingress<br/>API_BASE_URL = http://EIP:8080 (do payload)"]
+            BACK["studio-essencia-backend<br/>JAVA / SPRING BOOT - API REST :8080<br/>JWT, Swagger, uploads (volume docker backend_uploads)<br/>publica notificacoes no RabbitMQ"]
+            ACT["studio-essencia-actions-service<br/>JAVA / SPRING BOOT - sem porta publicada<br/>consome fila de notificacao e chama o WAHA"]
+            WAHC["waha - devlikeapro/waha<br/>API de WhatsApp (NOWEB) + dashboard :3000<br/>volume docker waha_instances"]
+            WNOTE["O Swarm agenda esses 4 servicos entre os 2 workers<br/>(constraint node.labels.role == app).<br/>Rede overlay: studio-network com aliases mysql, rabbitmq, waha,<br/>studio-essencia-backend, studio-essencia-front. Managers publicam as portas e roteiam ate os containers (routing mesh)"]
+        end
     end
 
-    BRW -->|"HTTP 80 / 8080"| EIP
-    ADM -->|"SSH 22 + UIs 15672/3000"| EIP
-    EIP --> GWA
-    GWA -->|"proxy 80 frontend"| M1
-    GWA -->|"proxy 8080 API"| M2
-    GWA -->|"proxy 15672 + 3000"| M3
-    PRT --- IGW
-    PRTS -->|"saida NAT dos nos privados"| GWA
-    GWA --> IGW
-    GWS -. "monitora TCP :80<br/>e promove-se no failover" .-> GWA
-    DBN ---|"EBS gp3 Retain"| EBSA[("volume /data/mysql")]
-    RBN ---|"EBS gp3 Retain"| EBSB[("volume /data/rabbitmq")]
-    OVL -->|"3306 JDBC"| DBN
-    OVL -->|"5672 AMQP publish/consume"| RBN
-    OVL -->|"REST 3000"| WKS
-    WKS -->|"NOWEB"| WA
-    WKS -->|"upload/download"| S3
-    GWA -.-> SSMN
+    subgraph CFN["Origem dos recursos - CloudFormation (nomes do repo: studio-*; na subida manual atual: nat1 / gat1 / clu1)"]
+        SN["studio-network = 01-network.yml<br/>VPC, 5 sub-redes, IGW, 4 route tables, 6 security groups"]
+        SGW["studio-gateway = 02-gateway.yml<br/>EIP + 2 instancias gateway + rotas default das privadas<br/>Nginx/NAT via user-data + agente de failover<br/>export: GatewayStackName-PublicIp"]
+        SCL["studio-cluster = 03-cluster.yml<br/>3 managers + ASG(2 workers) + mysql + rabbitmq + EBS Retain<br/>bootstrap Docker/Swarm, tokens, labels<br/>AppPayload embutido = publicacao automatica da aplicacao"]
+    end
+
+    BRW --> EIP
+    ADM --> EIP
+    EIP --- GWA
+    GWS -.->|"failover: assume EIP, SG app e rotas"| EIP
+    GWA -->|"proxy 80"| M1
+    GWA -->|"proxy 8080"| M2
+    GWA -->|"proxy 15672 e 3000"| M3
+    RTA --> GWA
+    RTB --> GWA
+    RTC --> GWA
+    RTPUB -.- SPA
+    RTPUB -.- SPB
+    RTPUB --> IGW
+    GWA -->|"SNAT do cluster"| IGW
+    IGW --> NET
+    M1 -.-> WK
+    M2 -.-> WK
+    M3 -.-> WK
+    FRONT -.->|"o browser chama a API via EIP"| BACK
+    BACK -->|"3306"| DBN
+    BACK -->|"5672 publica eventos"| RBN
+    ACT -->|"5672 consome fila"| RBN
+    ACT -->|"HTTP 3000 envia WhatsApp"| WAHC
+    WAHC --> WAP
+    BACK -.->|"HTTPS via NAT"| S3
+    SN -.-> VPC
+    SGW -.-> GWA
+    SCL -.-> WK
     M1 -.-> SSMN
+    DBN -.-> SSMN
+    GWA -.-> SSMN
