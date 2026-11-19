@@ -57,7 +57,7 @@ Parameters:
   AllowedAdminCidr:
     Type: String
     AllowedPattern: "^(([0-9]{1,3}\\.){3}[0-9]{1,3})/([0-9]|[1-2][0-9]|3[0-2])$"
-    Description: "Seu IP publico em CIDR /32. Usado para SSH, RabbitMQ (15672) e WAHA (3000)."
+    Description: "Seu IP publico em CIDR /32. Usado para SSH, RabbitMQ (15672) e WAHA (3000) e Redis (6379)."
 
 Resources:
   Vpc:

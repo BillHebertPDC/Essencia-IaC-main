@@ -111,7 +111,7 @@ participam do ingress routing mesh, mas nao executam tarefas de aplicacao.
 | `scripts/switch-gateway.ps1` | Failback ou failover manual entre gateways |
 | `scripts/destroy-all.ps1` | Remove stacks, instancias, EIPs e, por padrao, volumes e snapshots |
 | `STEP-BY-STEP-CONSOLE.md` | Deploy em passos feito inteiramente pelo site (console) da AWS |
-| `diagrams/` | Diagramas Mermaid da topologia, requisicao e failover |
+| `diagrams/` | Diagramas Mermaid por stack (01-network, 02-gateway, 03-cluster), versoes AWS em flowchart (`architecture-aws.mmd` com icones e `infraestrutura-aws.mmd` sem icones; a 01 consolida EIP, EC2, EBS, ASG e anexos de SG na VPC) e visoes de topologia, requisicao (incluindo a sequencia detalhada), arquitetura logica AWS e failover |
 | `ARCHITECTURE.md` | Justificativas, riscos e criterios da arquitetura |
 
 ## Pre-requisitos
