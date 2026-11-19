@@ -50,8 +50,8 @@ Parameters:
 
   DataInstanceType:
     Type: String
-    Default: t3.small
-    Description: "Tipo dos nos dedicados de MySQL e RabbitMQ."
+    Default: t3.medium
+    Description: "Tipo dos nos dedicados de MySQL e RabbitMQ. t3.medium mantem 2 vCPU e dobra a RAM para 4 GiB, necessaria para hospedar o Redis junto com o RabbitMQ."
 
   WorkerCount:
     Type: Number
@@ -76,10 +76,10 @@ Parameters:
 
   DataVolumeSize:
     Type: Number
-    Default: 8
+    Default: 20
     MinValue: 8
     MaxValue: 200
-    Description: "Disco EBS de dados do MySQL e do RabbitMQ, em GiB. O minimo de 8 atende ao laboratorio."
+    Description: "Disco EBS de dados do MySQL e do RabbitMQ, em GiB. 20 acomoda /data/mysql, /data/rabbitmq e /data/redis (AOF do cache)."
 
   Manager1PrivateIp:
     Type: String
@@ -236,8 +236,8 @@ Resources:
                 mkdir -p /data
                 mountpoint -q /data || mount "$DATA_DEVICE" /data
                 grep -q 'LABEL=studio-data' /etc/fstab || echo 'LABEL=studio-data /data ext4 defaults,nofail 0 2' >> /etc/fstab
-                install -d -m 0770 /data/mysql /data/rabbitmq
-                chown -R 999:999 /data/mysql /data/rabbitmq || true
+                install -d -m 0770 /data/mysql /data/rabbitmq /data/redis
+                chown -R 999:999 /data/mysql /data/rabbitmq /data/redis || true
               }
 
               apt_update
@@ -519,7 +519,7 @@ Resources:
               Manager3PrivateIp: !Ref Manager3PrivateIp
               PublicHost: !ImportValue
                 Fn::Sub: "${GatewayStackName}-PublicIp"
-              AppPayload: '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'
+              AppPayload: '/Td6WFoAAATm1rRGAgAhARYAAAB0L+Wj4B5lCHNdABGIQkY99BhqpmeveqFJqtoo9mJ9mhG1S/v7IjPXidTg/fco+hgQMyGA1D6hl9ba1791uj9ZU1/hKe1yjrSSJyZIczUYRtRbyudufOFwwstyP73EGV4mhuyn2v6nP3ewRcBlV6LLW0uSjSg9nFAFQI7O0BRRl0X5fX4meo3I0516MknDSrztGhnm1GtGwckF5ctRlemwXZk6oEDTf2ry3RfOzZmrYy0xjKf51Ldk9Rgi9MQfU+0ElvZDcOXKpNOxS9cYSwsQN4lZgR0m5wOl6qkqXwAqhPJu1UFDYqGUhzv+lfcNVFPWCyMNGy36ep2dQfG/1IphfsnVjrvzABrnOXqfTYbpvMEHr7Oy1nNWp+vBwpy2LxRnRBmWnTeW+pSTnjvqXUzxfUtBxAv4Z4bcTEg6wMEgyYnJhbjZfFRybGMzuFRlzUDByr3g8085vbGVZ/zstRT1owf+jEICqQFFMOA0dr3pU7cFOqiK8YoFm9dYkr5wWitL8g+gIchqJqIV5RrpmktR0hM/r+pMc/K6gHTF/D6crtQ9ALjygRzpCoxBlhjk7tqPbJ5TRzXBUeAjl6qfC/8DF98UmZ0QjzKBq/jmorzoE5zw1bHcuFXFP/JJ7uS+rOIKCApCN6GvavZA3VRm5alAxxo3KtUPM32Lj0p62Rd5SVq6eB8d6jMyE0dcifW3SX5Hs7i0d5qW/yeefoXZWGEzRhPTVAL5ZJ0FhUVThghWZDBGuisybFOEEOwDLH00R7G9jgbRefqkfR76owAm4IkfykYbNDqiH7aiN+RZRj4jagIsBv6Gr2nBCxu2xbx2B876vy/Mvo7u8ag3N8P2Ph8ckDFQstPHhovX10ZLIeFTt2zs4fyo/Eq1YMAApJzl4YcWPOtedYha6rEHlLNC+UpStnQIP6UEt8X9KYRh6X/5Hk5F28u60e+O2a3/plnOzd3UHjLr9QNUkYRl9fDMJ7/rFfViQlw05zsfuA+qiYUMMrh2TjsPmdpxqr9muCyndQ79Am+Bsr+VXi2Ok21MngSSY0Q1zEEGIPfgSSoSizpcCbygz3VygxMtuhp4y9fEFwExShtqvZE1LakSAgm7C3p82eQIZv/haADlD7vvRbSHJ497a0a64FWrlKc+sVQAcPuGRCCmIqQ9GIzqoUk2dUn5AyXA7I3Lbfx7QpYzCqiACOFjEvhWNgARTAXiKqlTu4h/nfr0E8NjuekdfvE12omjzQ4r2tQbNIhvf+E3pqQ9GT4PxFgqtkSLz+HFGFV/vsyfJNXsHfpP5ZMOsDC/yRt893VdT04M09q2NqEOg5dHR7H23eSHcEtWvgsGkC8ckF3xQljHTpjOXxnCV84Huy0mAeFGI0z+xYdIlb9tQE4LsJbFHqW/k95FpZj4IByMhdNn+N9mjQ6UO1LNtq0p13Rfg67gmshk1QpDf7vYqgYnnNZPe+TWZgDYVOU5l/eeVq7ejDaGAbJvCdAaDtJDAYPJJIcpyBYWEbXactcjDXZTnYPfpE2G7mBdAkfE6qTFWs0pF3oh646YR8m2HsBqDAseTHCX/p/bzpbLzmpuqAjS9j6Oc4H8WHvukfIOY6YFisHXeTxX50YWU95byalOejgzBB8aBIMHacDEPN5ex090/TB+KvoHYodL3tryyQGbB/k7LQpCqFLaNHB1CzU0GJr4qipdnVWnLSdqiOSpiZXSsFVSuiItujegJCi0uW1fMQTY0lNHyzIIVfKox+5LpiFufQ/5HhHapOogzHEdMrptATcizUiX1XFklJ3mxKQ+BVE1LGvu+kFluF2cvmAVJWpBvQ0mFwskXxDh0ARBikAkt0wOaO9ei5z5bkjjFrx68P/DtqAmGjgwNDlCYqQgISPj0iIBI44tmtNHOKsGkmgv8mOxj5Q/VW4S++CD3XHg+V4zf7SHNR0l7oEhMS80Fz190cxSlXOwghfj+AGVi+DjSbQ1iKHKQo8HRi24FjCXEdLnx4T3M8+xEvmJ28vYVpNFY18pnZBYCXS5ai2jx4tj7IqTGC3uEnWvtgMHwMsOxmIkJSv9mRGkJl/ssswAIaKILuYmsZ6wINX26CnVs1qbaxQx7q5Die62pEr05rJI8J1EZoyXQP/eAaFY7XB7L5ORQqd0uGAEbAiYJKWX9si/2vtho4kMxh12EDFgqN6xrFcfK96UUUZw/1c8FwVm63LVDumnVb4K4q+ZhZwM20o37n2G8RN+tYlUyvkJujtdegq9OPy8RHZOEa3aRogX8Gkgz2svSsd49fntNHUcAQlTSpv2wCVx3i9PwtQ63yGKjE5y85MXjt1QYtCLQ9/2of8RD+SIOJEUEzT1crxm/T6LVeVKb5qLdfSCxzQBEeTv789k9S2fKZT8NncFgzSB/ISMXT+eLck4149KPdgdFv2f1hVuIOTsgbY8zcOM8mjbWvFcb/YwygJFpzUhmraRGpySW6UXbA1E8KsQguTv/RYHmz/iRSb5HB9pOjZdMTLCPlLP4kV4M1xfqJ8GHuY2eZ5pfWwIFWA0AHyzQLkv3ak9OcEzKrz9WH5vq0FTlcX36lX2d9JvWtlbkqjtm6qzL7Gab9ImB4+BQT3LeP0YaYjv/dFAaOvm9nCHz/gpWpntpumrVpwWa/gPmSiNDRffra43STR/sPVmmRun+RyJ8rmXhm6Z/IcI2YDTzdu3sagPunjgR1n5eJpmK8O18N6ZjEXMmYmB7TZHfyX/XmEq2mNj6MFR1tyv3ElmtNwmHSidawvHJckt2mJJBl9WjUCNjvUazpSrRGQ1UxwntfKYpI+zUm6Is334rxPDYLz4FDFYcHAkZyudDHOmYxm6e7v+OwnZj90UVOcM1UyV25IUkCmp60IE+X9/B6J214HnDWmf4IeotJHHfJxHKuIbvUHzdAAAiA3W4qcMgH0AAY8R5jwAAPLOVq+xxGf7AgAAAAAEWVo='
 
   Manager1:
     Type: "AWS::EC2::Instance"

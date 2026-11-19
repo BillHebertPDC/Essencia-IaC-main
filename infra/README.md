@@ -10,6 +10,8 @@ Esta pasta implementa a arquitetura alvo descrita em
 - Tres managers do Docker Swarm, um por AZ, com IPs privados fixos.
 - `N` workers de aplicacao em Auto Scaling Group, sem IP publico.
 - MySQL e RabbitMQ em workers dedicados, com volumes EBS proprios.
+- Redis como cache com AOF, rodando como servico Swarm no no do RabbitMQ
+  (`/data/redis` no mesmo EBS); nenhuma EC2 adicional.
 - Servicos de aplicacao presos a `node.role == worker` e
   `node.labels.role == app`.
 - A aplicacao e publicada automaticamente: o Compose vai embutido no template
@@ -34,11 +36,14 @@ Esta pasta implementa a arquitetura alvo descrita em
 > `WorkerCount` e `WorkerMaxSize` a 2.
 >
 > **Custo minimo:** os defaults usam `t3.micro` nos gateways e managers,
-> `t3.small` nos workers e nos de dados. O volume raiz de 8 GiB foi testado e
-> **nao e suficiente para o WAHA**: a extracao da imagem enche o disco e a task
-> falha. Por isso o default de `RootVolumeSize` e **20 GiB**; `DataVolumeSize`
-> e 8 GiB. Se o backend ou o WAHA sofrerem OOM, aumente apenas
-> `WorkerInstanceType` para `t3.medium`.
+> `t3.small` nos workers e `t3.medium` nos nos de dados. O `t3.medium` mantem
+> 2 vCPU (o total de vCPU continua 18) e dobra a RAM para 4 GiB, necessaria para
+> RabbitMQ + Redis no mesmo no. O volume raiz de 8 GiB foi testado e **nao e
+> suficiente para o WAHA**: a extracao da imagem enche o disco e a task falha.
+> Por isso o default de `RootVolumeSize` e **20 GiB**; `DataVolumeSize` e
+> **20 GiB** para acomodar `/data/mysql`, `/data/rabbitmq` e `/data/redis`. Se o
+> backend ou o WAHA sofrerem OOM, aumente apenas `WorkerInstanceType` para
+> `t3.medium`.
 >
 > **Ultima execucao validada (historico):** Swarm com 3 managers, 2 workers, 2
 > nos de dados e 2 gateways; stack da aplicacao com todos os servicos em `1/1`;
@@ -93,6 +98,7 @@ NAT 0.0.0.0/0 -> cluster
    |
    +--> MySQL    10.20.11.20 (worker role=database)
    +--> RabbitMQ 10.20.12.20 (worker role=rabbitmq)
+   |       +--> Redis :6379 (servico na overlay, /data/redis no mesmo EBS)
 ```
 
 O Nginx usa os tres IPs fixos dos managers como upstream. Os managers
@@ -104,7 +110,7 @@ participam do ingress routing mesh, mas nao executam tarefas de aplicacao.
 |---|---|
 | `01-network.yml` | VPC, duas sub-redes publicas, tres privadas, route tables e security groups |
 | `02-gateway.yml` | Dois gateways Nginx/NAT, um EIP (exportado), rotas privadas e agente de failover |
-| `03-cluster.yml` | Tres managers, workers, MySQL/RabbitMQ, EBS, labels e **publicacao automatica da aplicacao** (payload embutido) |
+| `03-cluster.yml` | Tres managers, workers, MySQL/RabbitMQ (com Redis no no do RabbitMQ), EBS, labels e **publicacao automatica da aplicacao** (payload embutido) |
 | `swarm/studio-essencia-stack-placement.yml` | Compose fonte; embutido no cluster via builder |
 | `swarm/app-bootstrap/deploy-app.sh` | Script que o manager 1 executa para publicar sozinho (fonte do payload) |
 | `scripts/build-app-payload.py` | Reempacota compose + script no `03-cluster.yml` (LZMA+base64) |
@@ -252,11 +258,11 @@ aws cloudformation deploy `
     KeyName=$KeyName `
     ManagerInstanceType=t3.micro `
     WorkerInstanceType=t3.small `
-    DataInstanceType=t3.small `
+    DataInstanceType=t3.medium `
     WorkerCount=2 `
     WorkerMaxSize=2 `
     RootVolumeSize=20 `
-    DataVolumeSize=8 `
+    DataVolumeSize=20 `
     Manager1PrivateIp=10.20.11.10 `
     Manager2PrivateIp=10.20.12.10 `
     Manager3PrivateIp=10.20.13.10 `
@@ -266,8 +272,10 @@ aws cloudformation deploy `
 ```
 
 A arquitetura completa tem `N + 7` instancias: `N` workers de aplicacao, 3
-managers, 2 gateways, 1 MySQL e 1 RabbitMQ. A stack do cluster cria `N + 5`
-(workers, managers, MySQL e RabbitMQ); os 2 gateways vem da stack anterior.
+managers, 2 gateways, 1 MySQL e 1 RabbitMQ. O Redis **nao conta como instancia**:
+ele e um servico Swarm fixado no no do RabbitMQ, usando o mesmo EBS. A stack do
+cluster cria `N + 5` (workers, managers, MySQL e RabbitMQ); os 2 gateways vem da
+stack anterior.
 No AWS Academy, use **`N=2`**: sao 9 instancias running. `N=3` exigiria 10;
 para caber em 9 seria preciso parar o gateway reserva (perdendo o failover) ou
 outro papel. Lambda apenas automatiza start/stop; ela nao cria capacidade nem
@@ -295,18 +303,20 @@ stack com backup ou aplicando `modify-volume` + `growpart`/`resize2fs`.
 
 Os managers usam IPs fixos porque o Nginx aponta para eles. Os workers de
 aplicacao usam o Auto Scaling Group nas tres sub-redes privadas. MySQL e
-RabbitMQ sao instancias unicas; nao sao alta disponibilidade.
+RabbitMQ sao instancias unicas; nao sao alta disponibilidade. O Redis tambem nao
+e alta disponibilidade: roda no mesmo no do RabbitMQ e divide o destino dele.
 
 O `docker swarm init` fixa o pool overlay em `172.30.0.0/16` (`/24` por rede)
 para nao colidir com a VPC `10.20.0.0/16`.
 
 **Publicacao automatica da aplicacao:** o `03-cluster.yml` embute o Compose e o
-script `swarm/app-bootstrap/deploy-app.sh` (tar de um arquivo -> LZMA -> base64
-na linha `AppPayload:` do template). O user-data do manager 1 decodifica o
-payload em `/opt/studio/d.sh` e o executa em background: ele espera os 7 nos
-`Ready` e as 4 labels de papel, exporta `API_BASE_URL`/`CORS_ALLOWED_ORIGINS`
-com o EIP importado da stack `studio-gateway` (output `PublicIp`, exportado como
-`${AWS::StackName}-PublicIp`) e roda `docker stack deploy`. A stack do cluster
+script `swarm/app-bootstrap/deploy-app.sh` (LZMA -> base64 na linha `AppPayload:`
+do template). O user-data do manager 1 decodifica o payload em
+`/opt/studio/d.sh` e o executa em background: ele espera os 7 nos `Ready` e as 4
+labels de papel, exporta `API_BASE_URL`/`CORS_ALLOWED_ORIGINS` com o EIP
+importado da stack `studio-gateway` (output `PublicIp`, exportado como
+`${AWS::StackName}-PublicIp`), roda `docker stack deploy` e so conclui quando os
+**7 servicos** (incluindo o Redis) estiverem em `1/1`. A stack do cluster
 conclui antes disso; o progresso fica em `/var/log/studio-app-deploy.log` no
 manager 1. Se voce editar o Compose ou o `deploy-app.sh`, rode
 `python scripts\build-app-payload.py` (a partir de `infra`) antes de criar ou
@@ -377,6 +387,10 @@ labeler aplica automaticamente:
 - `role=database` no MySQL;
 - `role=rabbitmq` no RabbitMQ.
 
+O servico Redis nao cria label novo: ele usa constraints
+`node.labels.role == rabbitmq` e `node.hostname == rabbitmq-data` no Compose,
+por isso so pode cair no no que ja tem o volume `/data/redis`.
+
 Nao rotule manualmente os nos; os hostnames `manager-*`, `app-worker-*`,
 `mysql-data` e `rabbitmq-data` sao usados pelo labeler.
 
@@ -410,6 +424,7 @@ docker stack services studio-essencia
 docker service ps studio-essencia_studio-essencia-backend
 docker service ps studio-essencia_mysql
 docker service ps studio-essencia_rabbitmq
+docker service ps studio-essencia_redis
 ```
 
 Se um servico ficar `Pending`, confira os labels:
@@ -493,6 +508,12 @@ Os bind mounts sao:
 
 - MySQL: `/data/mysql`
 - RabbitMQ: `/data/rabbitmq`
+- Redis (AOF, no mesmo volume do RabbitMQ): `/data/redis`
+
+O Redis usa `appendonly yes` com `appendfsync everysec` e `maxmemory 512mb`
+(com limite de 768M no container). Ele e cache: perder o AOF nao corrompe o
+banco, mas invalida o cache. O dado dele esta no mesmo snapshot EBS do
+RabbitMQ, entao o backup cobre os tres.
 
 Os volumes continuam existindo quando a stack do cluster e removida. Eles nao
 sao backup: se a instancia ou o volume for perdido, os dados podem ser perdidos.
@@ -515,16 +536,20 @@ de dados, monte em `/data` e valide MySQL/RabbitMQ antes de liberar a aplicacao.
 Um snapshot de 20 GiB nao pode ser restaurado em um volume de 8 GiB.
 
 MySQL e RabbitMQ continuam sendo pontos unicos de falha; uma falha de AZ que
-contenha o MySQL derruba o banco.
+contenha o MySQL derruba o banco. Uma falha no no do RabbitMQ derruba a
+mensageria **e o Redis** juntos (por isso o Redis nao deve ser usado como store
+de dados duraveis).
 
 ## 11. Custo, cotas e limite de 9 instancias
 
 - Instancias: `N + 7`; com `N=2`, sao 9 running.
-- vCPU aproximado: `14 + 2N` com `t3.micro` e `t3.small`; com `N=2`, 18 vCPU.
-- Tipos padrao: `t3.micro` (2 gateways e 3 managers) e `t3.small` (2 workers e
-  2 nos de dados).
+- vCPU aproximado: `14 + 2N` — o `t3.medium` dos nos de dados continua com
+  2 vCPU; com `N=2`, 18 vCPU.
+- Tipos padrao: `t3.micro` (2 gateways e 3 managers), `t3.small` (2 workers) e
+  `t3.medium` (2 nos de dados, para caber RabbitMQ + Redis nos 4 GiB de RAM).
 - Volumes: 20 GiB de root nos nos do cluster (8 GiB falhou no WAHA) e 8 GiB
-  nos gateways; 8 GiB de dados para novos volumes MySQL/RabbitMQ.
+  nos gateways; 20 GiB de dados para novos volumes MySQL/RabbitMQ (o do
+  RabbitMQ inclui `/data/redis`).
 - Um Elastic IP.
 - Sem NLB e sem NAT Gateway.
 
